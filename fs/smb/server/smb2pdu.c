@@ -3193,6 +3193,61 @@ static int parse_app_instance_id(struct smb2_create_req *req,
 	return 0;
 }
 
+struct smb2_open_state {
+	struct path path;
+	struct ksmbd_file *fp;
+	struct mnt_idmap *idmap;
+	struct kstat stat;
+	struct lease_ctx_info *lc;
+	struct create_ea_buf_req *ea_buf;
+	struct durable_info dh_info;
+	char *name;
+	char *stream_name;
+	u64 alloc_size;
+	umode_t posix_mode;
+	__le32 daccess;
+	__le32 maximal_access;
+	int req_op_level;
+	int open_flags;
+	int file_info;
+	int query_disk_id;
+	int s_type;
+	int iov_len;
+	bool maximal_access_ctxt;
+	bool posix_ctxt;
+	bool file_present;
+	bool created;
+};
+
+static int smb2_parse_posix_create_context(struct ksmbd_work *work,
+					   struct smb2_create_req *req,
+					   struct smb2_open_state *state)
+{
+	struct create_context *context;
+	struct create_posix *posix;
+
+	if (!req->CreateContextsOffset || !work->tcon->posix_extensions)
+		return 0;
+
+	context = smb2_find_context_vals(req, SMB2_CREATE_TAG_POSIX, 16);
+	if (IS_ERR(context))
+		return PTR_ERR(context);
+	if (!context)
+		return 0;
+
+	if (le16_to_cpu(context->DataOffset) +
+	    le32_to_cpu(context->DataLength) <
+	    sizeof(struct create_posix) - 4)
+		return -EINVAL;
+
+	ksmbd_debug(SMB, "get posix context\n");
+
+	posix = (struct create_posix *)context;
+	state->posix_mode = le32_to_cpu(posix->Mode);
+	state->posix_ctxt = true;
+	return 0;
+}
+
 /**
  * smb2_open() - handler for smb file open request
  * @work:	smb work containing request buffer
@@ -3206,6 +3261,7 @@ int smb2_open(struct ksmbd_work *work)
 	struct ksmbd_tree_connect *tcon = work->tcon;
 	struct smb2_create_req *req;
 	struct smb2_create_rsp *rsp;
+	struct smb2_open_state state = {};
 	struct path path;
 	struct ksmbd_share_config *share = tcon->share_conf;
 	struct ksmbd_file *fp = NULL;
@@ -3221,7 +3277,7 @@ int smb2_open(struct ksmbd_work *work)
 	int req_op_level = 0, open_flags = 0, may_flags = 0, file_info = 0;
 	int rc = 0;
 	int contxt_cnt = 0, query_disk_id = 0;
-	bool maximal_access_ctxt = false, posix_ctxt = false;
+	bool maximal_access_ctxt = false;
 	int s_type = 0;
 	int next_off = 0;
 	char *name = NULL;
@@ -3229,7 +3285,6 @@ int smb2_open(struct ksmbd_work *work)
 	bool file_present = false, created = false, already_permitted = false;
 	int share_ret, need_truncate = 0;
 	u64 time, alloc_size = 0;
-	umode_t posix_mode = 0;
 	__le32 daccess, maximal_access = 0;
 	int iov_len = 0;
 
@@ -3250,26 +3305,9 @@ int smb2_open(struct ksmbd_work *work)
 		return create_smb2_pipe(work);
 	}
 
-	if (req->CreateContextsOffset && tcon->posix_extensions) {
-		context = smb2_find_context_vals(req, SMB2_CREATE_TAG_POSIX, 16);
-		if (IS_ERR(context)) {
-			rc = PTR_ERR(context);
-			goto err_out2;
-		} else if (context) {
-			struct create_posix *posix = (struct create_posix *)context;
-
-			if (le16_to_cpu(context->DataOffset) +
-				le32_to_cpu(context->DataLength) <
-			    sizeof(struct create_posix) - 4) {
-				rc = -EINVAL;
-				goto err_out2;
-			}
-			ksmbd_debug(SMB, "get posix context\n");
-
-			posix_mode = le32_to_cpu(posix->Mode);
-			posix_ctxt = true;
-		}
-	}
+	rc = smb2_parse_posix_create_context(work, req, &state);
+	if (rc)
+		goto err_out2;
 
 	if (req->NameLength) {
 		name = smb2_get_name((char *)req + le16_to_cpu(req->NameOffset),
@@ -3283,7 +3321,7 @@ int smb2_open(struct ksmbd_work *work)
 
 		ksmbd_debug(SMB, "converted name = %s\n", name);
 
-		if (posix_ctxt == false) {
+		if (!state.posix_ctxt) {
 			if (strchr(name, ':')) {
 				if (!test_share_config_flag(work->tcon->share_conf,
 							KSMBD_SHARE_FLAG_STREAMS)) {
@@ -3642,7 +3680,7 @@ int smb2_open(struct ksmbd_work *work)
 	/*create file if not present */
 	if (!file_present) {
 		rc = smb2_creat(work, &path, name, open_flags,
-				posix_mode,
+				state.posix_mode,
 				req->CreateOptions & FILE_DIRECTORY_FILE_LE);
 		if (rc) {
 			if (rc == -ENOENT) {
@@ -3837,7 +3875,7 @@ int smb2_open(struct ksmbd_work *work)
 	fp->attrib_only = !(req->DesiredAccess & ~(FILE_READ_ATTRIBUTES_LE |
 			FILE_WRITE_ATTRIBUTES_LE | FILE_SYNCHRONIZE_LE));
 
-	fp->is_posix_ctxt = posix_ctxt;
+	fp->is_posix_ctxt = state.posix_ctxt;
 
 	/* fp should be searchable through ksmbd_inode.m_fp_list
 	 * after daccess, saccess, attrib_only, and stream are
@@ -4143,7 +4181,7 @@ reconnected_fp:
 		next_off = conn->vals->create_durable_size;
 	}
 
-	if (posix_ctxt) {
+	if (state.posix_ctxt) {
 		contxt_cnt++;
 		create_posix_rsp_buf(rsp->Buffer +
 				le32_to_cpu(rsp->CreateContextsLength),
