@@ -3248,6 +3248,57 @@ static int smb2_parse_posix_create_context(struct ksmbd_work *work,
 	return 0;
 }
 
+static int smb2_open_get_name(struct ksmbd_work *work,
+			      struct smb2_create_req *req,
+			      struct smb2_open_state *state)
+{
+	struct ksmbd_share_config *share = work->tcon->share_conf;
+	int rc;
+
+	if (!req->NameLength) {
+		state->name = kstrdup("", KSMBD_DEFAULT_GFP);
+		if (!state->name)
+			return -ENOMEM;
+		return 0;
+	}
+
+	state->name = smb2_get_name((char *)req + le16_to_cpu(req->NameOffset),
+				    le16_to_cpu(req->NameLength),
+				    work->conn->local_nls);
+	if (IS_ERR(state->name)) {
+		rc = PTR_ERR(state->name);
+		state->name = NULL;
+		return rc;
+	}
+
+	ksmbd_debug(SMB, "converted name = %s\n", state->name);
+
+	if (!state->posix_ctxt) {
+		if (strchr(state->name, ':')) {
+			if (!test_share_config_flag(share,
+						    KSMBD_SHARE_FLAG_STREAMS))
+				return -EBADF;
+
+			rc = parse_stream_name(state->name, &state->stream_name,
+					       &state->s_type);
+			if (rc < 0)
+				return rc;
+		}
+
+		rc = ksmbd_validate_filename(state->name);
+		if (rc < 0)
+			return rc;
+	}
+
+	if (ksmbd_share_veto_filename(share, state->name)) {
+		ksmbd_debug(SMB, "Reject open(), vetoed file: %s\n",
+			    state->name);
+		return -ENOENT;
+	}
+
+	return 0;
+}
+
 /**
  * smb2_open() - handler for smb file open request
  * @work:	smb work containing request buffer
@@ -3278,10 +3329,7 @@ int smb2_open(struct ksmbd_work *work)
 	int rc = 0;
 	int contxt_cnt = 0, query_disk_id = 0;
 	bool maximal_access_ctxt = false;
-	int s_type = 0;
 	int next_off = 0;
-	char *name = NULL;
-	char *stream_name = NULL;
 	bool file_present = false, created = false, already_permitted = false;
 	int share_ret, need_truncate = 0;
 	u64 time, alloc_size = 0;
@@ -3309,48 +3357,9 @@ int smb2_open(struct ksmbd_work *work)
 	if (rc)
 		goto err_out2;
 
-	if (req->NameLength) {
-		name = smb2_get_name((char *)req + le16_to_cpu(req->NameOffset),
-				     le16_to_cpu(req->NameLength),
-				     work->conn->local_nls);
-		if (IS_ERR(name)) {
-			rc = PTR_ERR(name);
-			name = NULL;
-			goto err_out2;
-		}
-
-		ksmbd_debug(SMB, "converted name = %s\n", name);
-
-		if (!state.posix_ctxt) {
-			if (strchr(name, ':')) {
-				if (!test_share_config_flag(work->tcon->share_conf,
-							KSMBD_SHARE_FLAG_STREAMS)) {
-					rc = -EBADF;
-					goto err_out2;
-				}
-				rc = parse_stream_name(name, &stream_name, &s_type);
-				if (rc < 0)
-					goto err_out2;
-			}
-
-			rc = ksmbd_validate_filename(name);
-			if (rc < 0)
-				goto err_out2;
-		}
-
-		if (ksmbd_share_veto_filename(share, name)) {
-			rc = -ENOENT;
-			ksmbd_debug(SMB, "Reject open(), vetoed file: %s\n",
-				    name);
-			goto err_out2;
-		}
-	} else {
-		name = kstrdup("", KSMBD_DEFAULT_GFP);
-		if (!name) {
-			rc = -ENOMEM;
-			goto err_out2;
-		}
-	}
+	rc = smb2_open_get_name(work, req, &state);
+	if (rc)
+		goto err_out2;
 
 	req_op_level = req->RequestedOplockLevel;
 
@@ -3379,7 +3388,7 @@ int smb2_open(struct ksmbd_work *work)
 
 		if (dh_info.reconnected == true) {
 			rc = smb2_check_durable_oplock(conn, share, dh_info.fp,
-					lc, sess->user, name);
+					lc, sess->user, state.name);
 			if (rc)
 				goto err_out2;
 
@@ -3533,7 +3542,7 @@ int smb2_open(struct ksmbd_work *work)
 		goto err_out2;
 	}
 
-	rc = ksmbd_vfs_kern_path(work, name, LOOKUP_NO_SYMLINKS,
+	rc = ksmbd_vfs_kern_path(work, state.name, LOOKUP_NO_SYMLINKS,
 				 &path, 1);
 
 	/*
@@ -3548,7 +3557,7 @@ int smb2_open(struct ksmbd_work *work)
 	     req->CreateDisposition == FILE_OPEN_IF_LE) &&
 	    ksmbd_close_disconnected_durable_delete_on_close(path.dentry)) {
 		path_put(&path);
-		rc = ksmbd_vfs_kern_path(work, name, LOOKUP_NO_SYMLINKS,
+		rc = ksmbd_vfs_kern_path(work, state.name, LOOKUP_NO_SYMLINKS,
 					 &path, 1);
 	}
 
@@ -3582,7 +3591,7 @@ int smb2_open(struct ksmbd_work *work)
 		if (rc != -ENOENT)
 			goto err_out;
 		ksmbd_debug(SMB, "can not get linux path for %s, rc = %d\n",
-			    name, rc);
+			    state.name, rc);
 		rc = 0;
 	}
 
@@ -3593,15 +3602,15 @@ int smb2_open(struct ksmbd_work *work)
 	 * <dir>::$DATA with FILE_DIRECTORY_FILE must fail with
 	 * STATUS_NOT_A_DIRECTORY.
 	 */
-	if (stream_name || s_type == DATA_STREAM) {
+	if (state.stream_name || state.s_type == DATA_STREAM) {
 		if (req->CreateOptions & FILE_DIRECTORY_FILE_LE) {
-			if (s_type == DATA_STREAM) {
+			if (state.s_type == DATA_STREAM) {
 				rc = -EIO;
 				rsp->hdr.Status = STATUS_NOT_A_DIRECTORY;
 			}
 		} else {
 			if (file_present && S_ISDIR(d_inode(path.dentry)->i_mode) &&
-			    s_type == DATA_STREAM) {
+			    state.s_type == DATA_STREAM) {
 				rc = -EIO;
 				rsp->hdr.Status = STATUS_FILE_IS_A_DIRECTORY;
 			}
@@ -3621,7 +3630,7 @@ int smb2_open(struct ksmbd_work *work)
 	    S_ISDIR(d_inode(path.dentry)->i_mode) &&
 	    !(req->CreateOptions & FILE_DELETE_ON_CLOSE_LE)) {
 		ksmbd_debug(SMB, "open() argument is a directory: %s, %x\n",
-			    name, req->CreateOptions);
+			    state.name, req->CreateOptions);
 		rsp->hdr.Status = STATUS_FILE_IS_A_DIRECTORY;
 		rc = -EIO;
 		goto err_out;
@@ -3635,7 +3644,7 @@ int smb2_open(struct ksmbd_work *work)
 		goto err_out;
 	}
 
-	if (!stream_name && file_present &&
+	if (!state.stream_name && file_present &&
 	    req->CreateDisposition == FILE_CREATE_LE) {
 		rc = -EEXIST;
 		goto err_out;
@@ -3679,7 +3688,7 @@ int smb2_open(struct ksmbd_work *work)
 
 	/*create file if not present */
 	if (!file_present) {
-		rc = smb2_creat(work, &path, name, open_flags,
+		rc = smb2_creat(work, &path, state.name, open_flags,
 				state.posix_mode,
 				req->CreateOptions & FILE_DIRECTORY_FILE_LE);
 		if (rc) {
@@ -3862,11 +3871,11 @@ int smb2_open(struct ksmbd_work *work)
 		rc = 0;
 	}
 
-	if (stream_name) {
+	if (state.stream_name) {
 		rc = smb2_set_stream_name_xattr(&path,
 						fp,
-						stream_name,
-						s_type);
+						state.stream_name,
+						state.s_type);
 		if (rc)
 			goto err_out;
 		file_info = FILE_CREATED;
@@ -3891,7 +3900,7 @@ int smb2_open(struct ksmbd_work *work)
 		goto err_out;
 	}
 
-	if (!stream_name && daccess & FILE_DELETE_LE &&
+	if (!state.stream_name && daccess & FILE_DELETE_LE &&
 	    ksmbd_has_stream_without_delete_share(fp)) {
 		rc = -EPERM;
 		goto err_out;
@@ -3901,7 +3910,7 @@ int smb2_open(struct ksmbd_work *work)
 		path_put(&path);
 
 	if (!S_ISDIR(file_inode(filp)->i_mode) && open_flags & O_TRUNC &&
-	    !fp->attrib_only && !stream_name) {
+	    !fp->attrib_only && !state.stream_name) {
 		smb_break_all_oplock(work, fp);
 		need_truncate = 1;
 	}
@@ -3931,7 +3940,7 @@ int smb2_open(struct ksmbd_work *work)
 			req_op_level = smb2_map_lease_to_oplock(lc->req_state);
 			ksmbd_debug(SMB,
 				    "lease req for(%s) req oplock state 0x%x, lease state 0x%x\n",
-				    name, req_op_level, lc->req_state);
+				    state.name, req_op_level, lc->req_state);
 			rc = find_same_lease_key(conn, fp->f_ci, lc);
 			if (rc)
 				goto err_out1;
@@ -4100,7 +4109,7 @@ reconnected_fp:
 		struct create_context *lease_ccontext;
 
 		ksmbd_debug(SMB, "lease granted on(%s) lease state 0x%x\n",
-			    name, opinfo->o_lease->state);
+			    state.name, opinfo->o_lease->state);
 		rsp->OplockLevel = SMB2_OPLOCK_LEVEL_LEASE;
 
 		lease_ccontext = (struct create_context *)rsp->Buffer;
@@ -4258,7 +4267,7 @@ err_out2:
 			ksmbd_put_durable_fd(dh_info.fp);
 	}
 
-	kfree(name);
+	kfree(state.name);
 	kfree(lc);
 
 	return rc;
