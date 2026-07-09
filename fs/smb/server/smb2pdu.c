@@ -3219,6 +3219,35 @@ struct smb2_open_state {
 	bool created;
 };
 
+static int smb2_parse_posix_create_context(struct ksmbd_work *work,
+					   struct smb2_create_req *req,
+					   struct smb2_open_state *state)
+{
+	struct create_context *context;
+	struct create_posix *posix;
+
+	if (!req->CreateContextsOffset || !work->tcon->posix_extensions)
+		return 0;
+
+	context = smb2_find_context_vals(req, SMB2_CREATE_TAG_POSIX, 16);
+	if (IS_ERR(context))
+		return PTR_ERR(context);
+	if (!context)
+		return 0;
+
+	if (le16_to_cpu(context->DataOffset) +
+	    le32_to_cpu(context->DataLength) <
+	    sizeof(struct create_posix) - 4)
+		return -EINVAL;
+
+	ksmbd_debug(SMB, "get posix context\n");
+
+	posix = (struct create_posix *)context;
+	state->posix_mode = le32_to_cpu(posix->Mode);
+	state->posix_ctxt = true;
+	return 0;
+}
+
 /**
  * smb2_open() - handler for smb file open request
  * @work:	smb work containing request buffer
@@ -3263,26 +3292,9 @@ int smb2_open(struct ksmbd_work *work)
 		return create_smb2_pipe(work);
 	}
 
-	if (req->CreateContextsOffset && tcon->posix_extensions) {
-		context = smb2_find_context_vals(req, SMB2_CREATE_TAG_POSIX, 16);
-		if (IS_ERR(context)) {
-			rc = PTR_ERR(context);
-			goto err_out2;
-		} else if (context) {
-			struct create_posix *posix = (struct create_posix *)context;
-
-			if (le16_to_cpu(context->DataOffset) +
-				le32_to_cpu(context->DataLength) <
-			    sizeof(struct create_posix) - 4) {
-				rc = -EINVAL;
-				goto err_out2;
-			}
-			ksmbd_debug(SMB, "get posix context\n");
-
-			state.posix_mode = le32_to_cpu(posix->Mode);
-			state.posix_ctxt = true;
-		}
-	}
+	rc = smb2_parse_posix_create_context(work, req, &state);
+	if (rc)
+		goto err_out2;
 
 	if (req->NameLength) {
 		state.name = smb2_get_name((char *)req + le16_to_cpu(req->NameOffset),
@@ -3296,7 +3308,7 @@ int smb2_open(struct ksmbd_work *work)
 
 		ksmbd_debug(SMB, "converted name = %s\n", state.name);
 
-		if (state.posix_ctxt == false) {
+		if (!state.posix_ctxt) {
 			if (strchr(state.name, ':')) {
 				if (!test_share_config_flag(work->tcon->share_conf,
 							KSMBD_SHARE_FLAG_STREAMS)) {
