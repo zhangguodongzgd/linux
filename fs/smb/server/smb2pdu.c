@@ -3579,6 +3579,61 @@ static int smb2_create_inherit_acls(struct ksmbd_work *work,
 	return 0;
 }
 
+static int smb2_apply_create_contexts(struct ksmbd_work *work,
+				      struct smb2_create_req *req,
+				      struct ksmbd_file *fp,
+				      struct smb2_open_state *state)
+{
+	struct ksmbd_conn *conn = work->conn;
+	struct create_context *context;
+	struct create_alloc_size_req *az_req;
+
+	if (!req->CreateContextsOffset)
+		return 0;
+
+	az_req = (struct create_alloc_size_req *)smb2_find_context_vals(req,
+				SMB2_CREATE_ALLOCATION_SIZE, 4);
+	if (IS_ERR(az_req))
+		return PTR_ERR(az_req);
+	if (az_req) {
+		int err;
+
+		if (le16_to_cpu(az_req->ccontext.DataOffset) +
+		    le32_to_cpu(az_req->ccontext.DataLength) <
+		    sizeof(struct create_alloc_size_req))
+			return -EINVAL;
+
+		state->alloc_size = le64_to_cpu(az_req->AllocationSize);
+		ksmbd_debug(SMB,
+			    "request smb2 create allocate size : %llu\n",
+			    state->alloc_size);
+		smb_break_all_levII_oplock(work, fp, 1);
+		err = vfs_fallocate(fp->filp, FALLOC_FL_KEEP_SIZE, 0,
+				    state->alloc_size);
+		if (err < 0)
+			ksmbd_debug(SMB, "vfs_fallocate is failed : %d\n",
+				    err);
+	}
+
+	context = smb2_find_context_vals(req, SMB2_CREATE_QUERY_ON_DISK_ID, 4);
+	if (IS_ERR(context))
+		return PTR_ERR(context);
+	if (context) {
+		ksmbd_debug(SMB, "get query on disk id context\n");
+		state->query_disk_id = 1;
+	}
+
+	if (!conn->is_aapl) {
+		context = smb2_find_context_vals(req, SMB2_CREATE_AAPL, 4);
+		if (IS_ERR(context))
+			return PTR_ERR(context);
+		if (context)
+			conn->is_aapl = true;
+	}
+
+	return 0;
+}
+
 /**
  * smb2_open() - handler for smb file open request
  * @work:	smb work containing request buffer
@@ -3595,7 +3650,6 @@ int smb2_open(struct ksmbd_work *work)
 	struct smb2_open_state state = {};
 	struct ksmbd_share_config *share = tcon->share_conf;
 	struct file *filp = NULL;
-	struct create_context *context;
 	struct oplock_info *opinfo;
 	__le32 *next_ptr = NULL;
 	int may_flags = 0;
@@ -3989,54 +4043,9 @@ int smb2_open(struct ksmbd_work *work)
 			goto err_out1;
 	}
 
-	if (req->CreateContextsOffset) {
-		struct create_alloc_size_req *az_req;
-
-		az_req = (struct create_alloc_size_req *)smb2_find_context_vals(req,
-					SMB2_CREATE_ALLOCATION_SIZE, 4);
-		if (IS_ERR(az_req)) {
-			rc = PTR_ERR(az_req);
-			goto err_out1;
-		} else if (az_req) {
-			int err;
-
-			if (le16_to_cpu(az_req->ccontext.DataOffset) +
-			    le32_to_cpu(az_req->ccontext.DataLength) <
-			    sizeof(struct create_alloc_size_req)) {
-				rc = -EINVAL;
-				goto err_out1;
-			}
-			state.alloc_size = le64_to_cpu(az_req->AllocationSize);
-			ksmbd_debug(SMB,
-				    "request smb2 create allocate size : %llu\n",
-				    state.alloc_size);
-			smb_break_all_levII_oplock(work, state.fp, 1);
-			err = vfs_fallocate(state.fp->filp, FALLOC_FL_KEEP_SIZE, 0,
-					    state.alloc_size);
-			if (err < 0)
-				ksmbd_debug(SMB,
-					    "vfs_fallocate is failed : %d\n",
-					    err);
-		}
-
-		context = smb2_find_context_vals(req, SMB2_CREATE_QUERY_ON_DISK_ID, 4);
-		if (IS_ERR(context)) {
-			rc = PTR_ERR(context);
-			goto err_out1;
-		} else if (context) {
-			ksmbd_debug(SMB, "get query on disk id context\n");
-			state.query_disk_id = 1;
-		}
-
-		if (conn->is_aapl == false) {
-			context = smb2_find_context_vals(req, SMB2_CREATE_AAPL, 4);
-			if (IS_ERR(context)) {
-				rc = PTR_ERR(context);
-				goto err_out1;
-			} else if (context)
-				conn->is_aapl = true;
-		}
-	}
+	rc = smb2_apply_create_contexts(work, req, state.fp, &state);
+	if (rc)
+		goto err_out1;
 
 	rc = ksmbd_vfs_getattr(&state.path, &state.stat);
 	if (rc)
