@@ -3359,6 +3359,52 @@ static int smb2_validate_create_request(struct smb2_create_req *req,
 	return 0;
 }
 
+static int smb2_parse_create_contexts(struct smb2_create_req *req,
+				      struct smb2_create_rsp *rsp,
+				      struct smb2_open_state *state)
+{
+	struct create_context *context;
+
+	if (!req->CreateContextsOffset)
+		return 0;
+
+	/* Parse non-durable handle create contexts */
+	context = smb2_find_context_vals(req, SMB2_CREATE_EA_BUFFER, 4);
+	if (IS_ERR(context))
+		return PTR_ERR(context);
+	if (context) {
+		state->ea_buf = (struct create_ea_buf_req *)context;
+		if (le16_to_cpu(context->DataOffset) +
+		    le32_to_cpu(context->DataLength) <
+		    sizeof(struct create_ea_buf_req))
+			return -EINVAL;
+		if (req->CreateOptions & FILE_NO_EA_KNOWLEDGE_LE) {
+			rsp->hdr.Status = STATUS_ACCESS_DENIED;
+			return -EACCES;
+		}
+	}
+
+	context = smb2_find_context_vals(req,
+					 SMB2_CREATE_QUERY_MAXIMAL_ACCESS_REQUEST,
+					 4);
+	if (IS_ERR(context))
+		return PTR_ERR(context);
+	if (context) {
+		ksmbd_debug(SMB, "get query maximal access context\n");
+		state->maximal_access_ctxt = true;
+	}
+
+	context = smb2_find_context_vals(req, SMB2_CREATE_TIMEWARP_REQUEST, 4);
+	if (IS_ERR(context))
+		return PTR_ERR(context);
+	if (context) {
+		ksmbd_debug(SMB, "get timewarp context\n");
+		return -EBADF;
+	}
+
+	return 0;
+}
+
 /**
  * smb2_open() - handler for smb file open request
  * @work:	smb work containing request buffer
@@ -3381,14 +3427,12 @@ int smb2_open(struct ksmbd_work *work)
 	struct kstat stat;
 	struct create_context *context;
 	struct lease_ctx_info *lc = NULL;
-	struct create_ea_buf_req *ea_buf = NULL;
 	struct oplock_info *opinfo;
 	struct durable_info dh_info = {0};
 	__le32 *next_ptr = NULL;
 	int req_op_level = 0, open_flags = 0, may_flags = 0, file_info = 0;
 	int rc = 0;
 	int contxt_cnt = 0, query_disk_id = 0;
-	bool maximal_access_ctxt = false;
 	int next_off = 0;
 	bool file_present = false, created = false, already_permitted = false;
 	int share_ret, need_truncate = 0;
@@ -3492,49 +3536,9 @@ int smb2_open(struct ksmbd_work *work)
 	if (rc)
 		goto err_out2;
 
-	if (req->CreateContextsOffset) {
-		/* Parse non-durable handle create contexts */
-		context = smb2_find_context_vals(req, SMB2_CREATE_EA_BUFFER, 4);
-		if (IS_ERR(context)) {
-			rc = PTR_ERR(context);
-			goto err_out2;
-		} else if (context) {
-			ea_buf = (struct create_ea_buf_req *)context;
-			if (le16_to_cpu(context->DataOffset) +
-			    le32_to_cpu(context->DataLength) <
-			    sizeof(struct create_ea_buf_req)) {
-				rc = -EINVAL;
-				goto err_out2;
-			}
-			if (req->CreateOptions & FILE_NO_EA_KNOWLEDGE_LE) {
-				rsp->hdr.Status = STATUS_ACCESS_DENIED;
-				rc = -EACCES;
-				goto err_out2;
-			}
-		}
-
-		context = smb2_find_context_vals(req,
-						 SMB2_CREATE_QUERY_MAXIMAL_ACCESS_REQUEST, 4);
-		if (IS_ERR(context)) {
-			rc = PTR_ERR(context);
-			goto err_out2;
-		} else if (context) {
-			ksmbd_debug(SMB,
-				    "get query maximal access context\n");
-			maximal_access_ctxt = 1;
-		}
-
-		context = smb2_find_context_vals(req,
-						 SMB2_CREATE_TIMEWARP_REQUEST, 4);
-		if (IS_ERR(context)) {
-			rc = PTR_ERR(context);
-			goto err_out2;
-		} else if (context) {
-			ksmbd_debug(SMB, "get timewarp context\n");
-			rc = -EBADF;
-			goto err_out2;
-		}
-	}
+	rc = smb2_parse_create_contexts(req, rsp, &state);
+	if (rc)
+		goto err_out2;
 
 	if (ksmbd_override_fsids(work)) {
 		rc = -ENOMEM;
@@ -3700,15 +3704,15 @@ int smb2_open(struct ksmbd_work *work)
 
 		created = true;
 		idmap = mnt_idmap(path.mnt);
-		if (ea_buf) {
-			if (le32_to_cpu(ea_buf->ccontext.DataLength) <
+		if (state.ea_buf) {
+			if (le32_to_cpu(state.ea_buf->ccontext.DataLength) <
 			    sizeof(struct smb2_ea_info)) {
 				rc = -EINVAL;
 				goto err_out;
 			}
 
-			rc = smb2_set_ea(&ea_buf->ea,
-					 le32_to_cpu(ea_buf->ccontext.DataLength),
+			rc = smb2_set_ea(&state.ea_buf->ea,
+					 le32_to_cpu(state.ea_buf->ccontext.DataLength),
 					 &path, false);
 			if (rc == -EOPNOTSUPP)
 				rc = 0;
@@ -4122,7 +4126,7 @@ reconnected_fp:
 	}
 	opinfo_put(opinfo);
 
-	if (maximal_access_ctxt) {
+	if (state.maximal_access_ctxt) {
 		struct create_context *mxac_ccontext;
 
 		if (maximal_access == 0)
