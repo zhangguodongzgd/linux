@@ -3383,6 +3383,65 @@ static int smb2_parse_create_contexts(struct smb2_create_req *req,
 	return 0;
 }
 
+static int smb2_lookup_open_path(struct ksmbd_work *work,
+				 struct smb2_create_req *req,
+				 struct path *path,
+				 char *name,
+				 bool *file_present)
+{
+	struct ksmbd_tree_connect *tcon = work->tcon;
+	int rc;
+
+	rc = ksmbd_vfs_kern_path(work, name, LOOKUP_NO_SYMLINKS, path, 1);
+
+	/*
+	 * A durable handle opened with delete-on-close is preserved across a
+	 * disconnect so it can be reclaimed by a durable reconnect.  When a new
+	 * delete-on-close open for the same name arrives instead, the
+	 * disconnected handle must give way: close it so its delete-on-close
+	 * removes the file, then re-resolve so this open can create a fresh one.
+	 */
+	if (!rc && (req->CreateOptions & FILE_DELETE_ON_CLOSE_LE) &&
+	    (req->CreateDisposition == FILE_OVERWRITE_IF_LE ||
+	     req->CreateDisposition == FILE_OPEN_IF_LE) &&
+	    ksmbd_close_disconnected_durable_delete_on_close(path->dentry)) {
+		path_put(path);
+		rc = ksmbd_vfs_kern_path(work, name, LOOKUP_NO_SYMLINKS,
+					 path, 1);
+	}
+
+	if (!rc) {
+		*file_present = true;
+
+		if (req->CreateOptions & FILE_DELETE_ON_CLOSE_LE) {
+			/*
+			 * If file exists with under flags, return access
+			 * denied error.
+			 */
+			if (req->CreateDisposition == FILE_OVERWRITE_IF_LE ||
+			    req->CreateDisposition == FILE_OPEN_IF_LE)
+				return -EACCES;
+
+			if (!test_tree_conn_flag(tcon,
+						 KSMBD_TREE_CONN_FLAG_WRITABLE)) {
+				ksmbd_debug(SMB,
+					    "User does not have write permission\n");
+				return -EACCES;
+			}
+		} else if (d_is_symlink(path->dentry)) {
+			return -EACCES;
+		}
+
+		return 0;
+	}
+
+	if (rc != -ENOENT)
+		return rc;
+
+	ksmbd_debug(SMB, "can not get linux path for %s, rc = %d\n", name, rc);
+	return 0;
+}
+
 /**
  * smb2_open() - handler for smb file open request
  * @work:	smb work containing request buffer
@@ -3531,58 +3590,11 @@ int smb2_open(struct ksmbd_work *work)
 		goto err_out2;
 	}
 
-	rc = ksmbd_vfs_kern_path(work, name, LOOKUP_NO_SYMLINKS,
-				 &path, 1);
-
-	/*
-	 * A durable handle opened with delete-on-close is preserved across a
-	 * disconnect so it can be reclaimed by a durable reconnect.  When a new
-	 * delete-on-close open for the same name arrives instead, the
-	 * disconnected handle must give way: close it so its delete-on-close
-	 * removes the file, then re-resolve so this open can create a fresh one.
-	 */
-	if (!rc && (req->CreateOptions & FILE_DELETE_ON_CLOSE_LE) &&
-	    (req->CreateDisposition == FILE_OVERWRITE_IF_LE ||
-	     req->CreateDisposition == FILE_OPEN_IF_LE) &&
-	    ksmbd_close_disconnected_durable_delete_on_close(path.dentry)) {
-		path_put(&path);
-		rc = ksmbd_vfs_kern_path(work, name, LOOKUP_NO_SYMLINKS,
-					 &path, 1);
-	}
-
-	if (!rc) {
-		file_present = true;
-
-		if (req->CreateOptions & FILE_DELETE_ON_CLOSE_LE) {
-			/*
-			 * If file exists with under flags, return access
-			 * denied error.
-			 */
-			if (req->CreateDisposition == FILE_OVERWRITE_IF_LE ||
-			    req->CreateDisposition == FILE_OPEN_IF_LE) {
-				rc = -EACCES;
-				goto err_out;
-			}
-
-			if (!test_tree_conn_flag(tcon, KSMBD_TREE_CONN_FLAG_WRITABLE)) {
-				ksmbd_debug(SMB,
-					    "User does not have write permission\n");
-				rc = -EACCES;
-				goto err_out;
-			}
-		} else if (d_is_symlink(path.dentry)) {
-			rc = -EACCES;
-			goto err_out;
-		}
-
+	rc = smb2_lookup_open_path(work, req, &path, name, &file_present);
+	if (rc)
+		goto err_out;
+	if (file_present)
 		idmap = mnt_idmap(path.mnt);
-	} else {
-		if (rc != -ENOENT)
-			goto err_out;
-		ksmbd_debug(SMB, "can not get linux path for %s, rc = %d\n",
-			    name, rc);
-		rc = 0;
-	}
 
 	/*
 	 * An explicit ::$DATA suffix names the unnamed data stream and is
