@@ -3499,6 +3499,86 @@ static int smb2_validate_stream_options(struct smb2_create_req *req,
 	return 0;
 }
 
+static int smb2_create_inherit_acls(struct ksmbd_work *work,
+				    struct smb2_create_req *req,
+				    struct smb2_open_state *state)
+{
+	struct ksmbd_conn *conn = work->conn;
+	struct ksmbd_session *sess = work->sess;
+	struct inode *inode = d_inode(state->path.dentry);
+	int posix_acl_rc;
+	int rc;
+
+	posix_acl_rc = ksmbd_vfs_inherit_posix_acl(state->idmap,
+						   &state->path,
+						   d_inode(state->path.dentry->d_parent));
+	if (posix_acl_rc)
+		ksmbd_debug(SMB, "inherit posix acl failed : %d\n",
+			    posix_acl_rc);
+
+	rc = smb2_create_sd_buffer(work, req, &state->path);
+	if (rc && rc != -ENOENT)
+		return rc;
+	if (rc != -ENOENT)
+		return 0;
+
+	if (test_share_config_flag(work->tcon->share_conf,
+				   KSMBD_SHARE_FLAG_ACL_XATTR)) {
+		rc = smb_inherit_dacl(conn, &state->path, sess->user->uid,
+				      sess->user->gid);
+	}
+	if (!rc)
+		return 0;
+
+	if (posix_acl_rc)
+		ksmbd_vfs_set_init_posix_acl(state->idmap, &state->path);
+
+	if (test_share_config_flag(work->tcon->share_conf,
+				   KSMBD_SHARE_FLAG_ACL_XATTR)) {
+		struct smb_fattr fattr;
+		struct smb_ntsd *pntsd;
+		int pntsd_size;
+		size_t scratch_len;
+
+		ksmbd_acls_fattr(&fattr, state->idmap, inode);
+		scratch_len = smb_acl_sec_desc_scratch_len(&fattr, NULL, 0,
+							   OWNER_SECINFO |
+							   GROUP_SECINFO |
+							   DACL_SECINFO);
+		if (!scratch_len || scratch_len == SIZE_MAX) {
+			posix_acl_release(fattr.cf_acls);
+			posix_acl_release(fattr.cf_dacls);
+			return -EFBIG;
+		}
+
+		pntsd = kvzalloc(scratch_len, KSMBD_DEFAULT_GFP);
+		if (!pntsd) {
+			posix_acl_release(fattr.cf_acls);
+			posix_acl_release(fattr.cf_dacls);
+			return -ENOMEM;
+		}
+
+		rc = build_sec_desc(state->idmap, pntsd, NULL, 0,
+				    OWNER_SECINFO | GROUP_SECINFO |
+				    DACL_SECINFO,
+				    &pntsd_size, &fattr);
+		posix_acl_release(fattr.cf_acls);
+		posix_acl_release(fattr.cf_dacls);
+		if (rc) {
+			kvfree(pntsd);
+			return rc;
+		}
+
+		rc = ksmbd_vfs_set_sd_xattr(conn, state->idmap, &state->path,
+					    pntsd, pntsd_size, false);
+		kvfree(pntsd);
+		if (rc)
+			pr_err("failed to store ntacl in xattr : %d\n", rc);
+	}
+
+	return 0;
+}
+
 /**
  * smb2_open() - handler for smb file open request
  * @work:	smb work containing request buffer
@@ -3807,84 +3887,9 @@ int smb2_open(struct ksmbd_work *work)
 
 	/* Set default windows and posix acls if creating new file */
 	if (state.created) {
-		int posix_acl_rc;
-		struct inode *inode = d_inode(state.path.dentry);
-
-		posix_acl_rc = ksmbd_vfs_inherit_posix_acl(state.idmap,
-							   &state.path,
-							   d_inode(state.path.dentry->d_parent));
-		if (posix_acl_rc)
-			ksmbd_debug(SMB, "inherit posix acl failed : %d\n", posix_acl_rc);
-
-		rc = smb2_create_sd_buffer(work, req, &state.path);
-		if (rc && rc != -ENOENT)
+		rc = smb2_create_inherit_acls(work, req, &state);
+		if (rc)
 			goto err_out;
-
-		if (rc == -ENOENT) {
-			if (test_share_config_flag(work->tcon->share_conf,
-						   KSMBD_SHARE_FLAG_ACL_XATTR)) {
-				rc = smb_inherit_dacl(conn, &state.path, sess->user->uid,
-						      sess->user->gid);
-			}
-			if (rc) {
-				if (posix_acl_rc)
-					ksmbd_vfs_set_init_posix_acl(state.idmap,
-								     &state.path);
-
-				if (test_share_config_flag(work->tcon->share_conf,
-							   KSMBD_SHARE_FLAG_ACL_XATTR)) {
-					struct smb_fattr fattr;
-					struct smb_ntsd *pntsd;
-					int pntsd_size;
-					size_t scratch_len;
-
-					ksmbd_acls_fattr(&fattr, state.idmap, inode);
-					scratch_len = smb_acl_sec_desc_scratch_len(&fattr,
-							NULL, 0,
-							OWNER_SECINFO | GROUP_SECINFO |
-							DACL_SECINFO);
-					if (!scratch_len || scratch_len == SIZE_MAX) {
-						rc = -EFBIG;
-						posix_acl_release(fattr.cf_acls);
-						posix_acl_release(fattr.cf_dacls);
-						goto err_out;
-					}
-
-					pntsd = kvzalloc(scratch_len, KSMBD_DEFAULT_GFP);
-					if (!pntsd) {
-						rc = -ENOMEM;
-						posix_acl_release(fattr.cf_acls);
-						posix_acl_release(fattr.cf_dacls);
-						goto err_out;
-					}
-
-					rc = build_sec_desc(state.idmap,
-							    pntsd, NULL, 0,
-							    OWNER_SECINFO |
-							    GROUP_SECINFO |
-							    DACL_SECINFO,
-							    &pntsd_size, &fattr);
-					posix_acl_release(fattr.cf_acls);
-					posix_acl_release(fattr.cf_dacls);
-					if (rc) {
-						kvfree(pntsd);
-						goto err_out;
-					}
-
-					rc = ksmbd_vfs_set_sd_xattr(conn,
-								    state.idmap,
-								    &state.path,
-								    pntsd,
-								    pntsd_size,
-								    false);
-					kvfree(pntsd);
-					if (rc)
-						pr_err("failed to store ntacl in xattr : %d\n",
-						       rc);
-				}
-			}
-		}
-		rc = 0;
 	}
 
 	if (state.stream_name) {
