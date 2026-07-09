@@ -3442,6 +3442,43 @@ static int smb2_lookup_open_path(struct ksmbd_work *work,
 	return 0;
 }
 
+static int smb2_validate_stream_options(struct smb2_create_req *req,
+					struct smb2_create_rsp *rsp,
+					struct path *path,
+					bool file_present,
+					char *stream_name,
+					int s_type)
+{
+	/*
+	 * An explicit ::$DATA suffix names the unnamed data stream and is
+	 * canonicalized to a NULL stream name (base file), but the request
+	 * still has to be validated against the data-stream type, e.g. opening
+	 * <dir>::$DATA with FILE_DIRECTORY_FILE must fail with
+	 * STATUS_NOT_A_DIRECTORY.
+	 */
+	if (!stream_name && s_type != DATA_STREAM)
+		return 0;
+
+	if (req->CreateOptions & FILE_DIRECTORY_FILE_LE) {
+		if (s_type == DATA_STREAM) {
+			rsp->hdr.Status = STATUS_NOT_A_DIRECTORY;
+			return -EIO;
+		}
+	} else if (file_present && S_ISDIR(d_inode(path->dentry)->i_mode) &&
+		   s_type == DATA_STREAM) {
+		rsp->hdr.Status = STATUS_FILE_IS_A_DIRECTORY;
+		return -EIO;
+	}
+
+	if (req->CreateOptions & FILE_DIRECTORY_FILE_LE &&
+	    req->FileAttributes & FILE_ATTRIBUTE_NORMAL_LE) {
+		rsp->hdr.Status = STATUS_NOT_A_DIRECTORY;
+		return -EIO;
+	}
+
+	return 0;
+}
+
 /**
  * smb2_open() - handler for smb file open request
  * @work:	smb work containing request buffer
@@ -3596,36 +3633,10 @@ int smb2_open(struct ksmbd_work *work)
 	if (file_present)
 		idmap = mnt_idmap(path.mnt);
 
-	/*
-	 * An explicit ::$DATA suffix names the unnamed data stream and is
-	 * canonicalized to a NULL stream name (base file), but the request
-	 * still has to be validated against the data-stream type, e.g. opening
-	 * <dir>::$DATA with FILE_DIRECTORY_FILE must fail with
-	 * STATUS_NOT_A_DIRECTORY.
-	 */
-	if (stream_name || s_type == DATA_STREAM) {
-		if (req->CreateOptions & FILE_DIRECTORY_FILE_LE) {
-			if (s_type == DATA_STREAM) {
-				rc = -EIO;
-				rsp->hdr.Status = STATUS_NOT_A_DIRECTORY;
-			}
-		} else {
-			if (file_present && S_ISDIR(d_inode(path.dentry)->i_mode) &&
-			    s_type == DATA_STREAM) {
-				rc = -EIO;
-				rsp->hdr.Status = STATUS_FILE_IS_A_DIRECTORY;
-			}
-		}
-
-		if (req->CreateOptions & FILE_DIRECTORY_FILE_LE &&
-		    req->FileAttributes & FILE_ATTRIBUTE_NORMAL_LE) {
-			rsp->hdr.Status = STATUS_NOT_A_DIRECTORY;
-			rc = -EIO;
-		}
-
-		if (rc < 0)
-			goto err_out;
-	}
+	rc = smb2_validate_stream_options(req, rsp, &path, file_present,
+					  stream_name, s_type);
+	if (rc)
+		goto err_out;
 
 	if (file_present && req->CreateOptions & FILE_NON_DIRECTORY_FILE_LE &&
 	    S_ISDIR(d_inode(path.dentry)->i_mode) &&
