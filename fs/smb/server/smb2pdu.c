@@ -3615,6 +3615,168 @@ static int smb2_apply_create_contexts(struct ksmbd_work *work,
 	return 0;
 }
 
+static void smb2_open_set_rsp(struct ksmbd_work *work,
+			      struct smb2_create_rsp *rsp,
+			      struct ksmbd_file *fp,
+			      const struct path *path,
+			      const struct kstat *stat,
+			      const struct durable_info *dh_info,
+			      struct mnt_idmap *idmap,
+			      char *name,
+			      int file_info,
+			      bool maximal_access_ctxt,
+			      __le32 maximal_access,
+			      int query_disk_id,
+			      bool posix_ctxt,
+			      int *iov_len)
+{
+	struct ksmbd_conn *conn = work->conn;
+	struct ksmbd_tree_connect *tcon = work->tcon;
+	struct oplock_info *opinfo;
+	__le32 *next_ptr = NULL;
+	u64 time;
+	int contxt_cnt = 0;
+	int next_off = 0;
+
+	rsp->StructureSize = cpu_to_le16(89);
+	opinfo = opinfo_get(fp);
+	rsp->OplockLevel = opinfo ? opinfo->level : 0;
+	rsp->Flags = 0;
+	rsp->CreateAction = cpu_to_le32(file_info);
+	rsp->CreationTime = cpu_to_le64(fp->create_time);
+	time = ksmbd_UnixTimeToNT(stat->atime);
+	rsp->LastAccessTime = cpu_to_le64(time);
+	time = ksmbd_UnixTimeToNT(stat->mtime);
+	fp->open_mtime = time;
+	rsp->LastWriteTime = cpu_to_le64(time);
+	rsp->ChangeTime = cpu_to_le64(fp->change_time);
+	/*
+	 * The cached allocation size hides filesystem rounding for the
+	 * requested allocation, but it can go stale when the file grows past
+	 * it via writes (e.g. across a durable reconnect). Refresh it once the
+	 * file exceeds the cached value, rounding the end of file up to the
+	 * volume allocation unit (the filesystem block size, matching the
+	 * SectorsPerAllocationUnit/BytesPerSector ksmbd advertises) rather than
+	 * using the raw on-disk block count, which can include filesystem
+	 * preallocation and metadata rounding.
+	 */
+	if (!S_ISDIR(stat->mode) && stat->size > fp->allocation_size)
+		fp->allocation_size = round_up(stat->size, stat->blksize);
+	rsp->AllocationSize = cpu_to_le64(fp->allocation_size);
+	rsp->EndofFile = S_ISDIR(stat->mode) ? 0 : cpu_to_le64(stat->size);
+	rsp->FileAttributes = fp->f_ci->m_fattr;
+
+	rsp->Reserved2 = 0;
+
+	rsp->PersistentFileId = fp->persistent_id;
+	rsp->VolatileFileId = fp->volatile_id;
+
+	rsp->CreateContextsOffset = 0;
+	rsp->CreateContextsLength = 0;
+	*iov_len = offsetof(struct smb2_create_rsp, Buffer);
+
+	/* If lease is request send lease context response */
+	if (opinfo && opinfo->is_lease) {
+		struct create_context *lease_ccontext;
+
+		ksmbd_debug(SMB, "lease granted on(%s) lease state 0x%x\n",
+			    name, opinfo->o_lease->state);
+		rsp->OplockLevel = SMB2_OPLOCK_LEVEL_LEASE;
+
+		lease_ccontext = (struct create_context *)rsp->Buffer;
+		contxt_cnt++;
+		create_lease_buf(rsp->Buffer, opinfo->o_lease);
+		le32_add_cpu(&rsp->CreateContextsLength,
+			     conn->vals->create_lease_size);
+		*iov_len += conn->vals->create_lease_size;
+		next_ptr = &lease_ccontext->Next;
+		next_off = conn->vals->create_lease_size;
+	}
+	opinfo_put(opinfo);
+
+	if (maximal_access_ctxt) {
+		struct create_context *mxac_ccontext;
+
+		if (maximal_access == 0)
+			ksmbd_vfs_query_maximal_access(idmap, path->dentry,
+						       &maximal_access);
+		mxac_ccontext = (struct create_context *)(rsp->Buffer +
+				le32_to_cpu(rsp->CreateContextsLength));
+		contxt_cnt++;
+		create_mxac_rsp_buf(rsp->Buffer +
+				le32_to_cpu(rsp->CreateContextsLength),
+				le32_to_cpu(maximal_access));
+		le32_add_cpu(&rsp->CreateContextsLength,
+			     conn->vals->create_mxac_size);
+		*iov_len += conn->vals->create_mxac_size;
+		if (next_ptr)
+			*next_ptr = cpu_to_le32(next_off);
+		next_ptr = &mxac_ccontext->Next;
+		next_off = conn->vals->create_mxac_size;
+	}
+
+	if (query_disk_id) {
+		struct create_context *disk_id_ccontext;
+
+		disk_id_ccontext = (struct create_context *)(rsp->Buffer +
+				le32_to_cpu(rsp->CreateContextsLength));
+		contxt_cnt++;
+		create_disk_id_rsp_buf(rsp->Buffer +
+				le32_to_cpu(rsp->CreateContextsLength),
+				stat->ino, tcon->id);
+		le32_add_cpu(&rsp->CreateContextsLength,
+			     conn->vals->create_disk_id_size);
+		*iov_len += conn->vals->create_disk_id_size;
+		if (next_ptr)
+			*next_ptr = cpu_to_le32(next_off);
+		next_ptr = &disk_id_ccontext->Next;
+		next_off = conn->vals->create_disk_id_size;
+	}
+
+	if (dh_info->type == DURABLE_REQ || dh_info->type == DURABLE_REQ_V2) {
+		struct create_context *durable_ccontext;
+
+		durable_ccontext = (struct create_context *)(rsp->Buffer +
+				le32_to_cpu(rsp->CreateContextsLength));
+		contxt_cnt++;
+		if (dh_info->type == DURABLE_REQ) {
+			create_durable_rsp_buf(rsp->Buffer +
+					le32_to_cpu(rsp->CreateContextsLength));
+			le32_add_cpu(&rsp->CreateContextsLength,
+				     conn->vals->create_durable_size);
+			*iov_len += conn->vals->create_durable_size;
+		} else {
+			create_durable_v2_rsp_buf(rsp->Buffer +
+					le32_to_cpu(rsp->CreateContextsLength),
+					fp);
+			le32_add_cpu(&rsp->CreateContextsLength,
+				     conn->vals->create_durable_v2_size);
+			*iov_len += conn->vals->create_durable_v2_size;
+		}
+
+		if (next_ptr)
+			*next_ptr = cpu_to_le32(next_off);
+		next_ptr = &durable_ccontext->Next;
+		next_off = conn->vals->create_durable_size;
+	}
+
+	if (posix_ctxt) {
+		contxt_cnt++;
+		create_posix_rsp_buf(rsp->Buffer +
+				le32_to_cpu(rsp->CreateContextsLength),
+				fp);
+		le32_add_cpu(&rsp->CreateContextsLength,
+			     conn->vals->create_posix_size);
+		*iov_len += conn->vals->create_posix_size;
+		if (next_ptr)
+			*next_ptr = cpu_to_le32(next_off);
+	}
+
+	if (contxt_cnt > 0)
+		rsp->CreateContextsOffset =
+			cpu_to_le32(offsetof(struct smb2_create_rsp, Buffer));
+}
+
 /**
  * smb2_open() - handler for smb file open request
  * @work:	smb work containing request buffer
@@ -3636,20 +3798,17 @@ int smb2_open(struct ksmbd_work *work)
 	struct kstat stat;
 	struct lease_ctx_info *lc = NULL;
 	struct create_ea_buf_req *ea_buf = NULL;
-	struct oplock_info *opinfo;
 	struct durable_info dh_info = {0};
-	__le32 *next_ptr = NULL;
 	int req_op_level = 0, open_flags = 0, may_flags = 0, file_info = 0;
 	int rc = 0;
-	int contxt_cnt = 0, query_disk_id = 0;
+	int query_disk_id = 0;
 	bool maximal_access_ctxt = false, posix_ctxt = false;
 	int s_type = 0;
-	int next_off = 0;
 	char *name = NULL;
 	char *stream_name = NULL;
 	bool file_present = false, created = false, already_permitted = false;
 	int share_ret, need_truncate = 0;
-	u64 time, alloc_size = 0;
+	u64 alloc_size = 0;
 	umode_t posix_mode = 0;
 	__le32 daccess, maximal_access = 0;
 	int iov_len = 0;
@@ -4095,145 +4254,9 @@ int smb2_open(struct ksmbd_work *work)
 	}
 
 reconnected_fp:
-	rsp->StructureSize = cpu_to_le16(89);
-	opinfo = opinfo_get(fp);
-	rsp->OplockLevel = opinfo != NULL ? opinfo->level : 0;
-	rsp->Flags = 0;
-	rsp->CreateAction = cpu_to_le32(file_info);
-	rsp->CreationTime = cpu_to_le64(fp->create_time);
-	time = ksmbd_UnixTimeToNT(stat.atime);
-	rsp->LastAccessTime = cpu_to_le64(time);
-	time = ksmbd_UnixTimeToNT(stat.mtime);
-	fp->open_mtime = time;
-	rsp->LastWriteTime = cpu_to_le64(time);
-	rsp->ChangeTime = cpu_to_le64(fp->change_time);
-	/*
-	 * The cached allocation size hides filesystem rounding for the
-	 * requested allocation, but it can go stale when the file grows past
-	 * it via writes (e.g. across a durable reconnect). Refresh it once the
-	 * file exceeds the cached value, rounding the end of file up to the
-	 * volume allocation unit (the filesystem block size, matching the
-	 * SectorsPerAllocationUnit/BytesPerSector ksmbd advertises) rather than
-	 * using the raw on-disk block count, which can include filesystem
-	 * preallocation and metadata rounding.
-	 */
-	if (!S_ISDIR(stat.mode) && stat.size > fp->allocation_size)
-		fp->allocation_size = round_up(stat.size, stat.blksize);
-	rsp->AllocationSize = cpu_to_le64(fp->allocation_size);
-	rsp->EndofFile = S_ISDIR(stat.mode) ? 0 : cpu_to_le64(stat.size);
-	rsp->FileAttributes = fp->f_ci->m_fattr;
-
-	rsp->Reserved2 = 0;
-
-	rsp->PersistentFileId = fp->persistent_id;
-	rsp->VolatileFileId = fp->volatile_id;
-
-	rsp->CreateContextsOffset = 0;
-	rsp->CreateContextsLength = 0;
-	iov_len = offsetof(struct smb2_create_rsp, Buffer);
-
-	/* If lease is request send lease context response */
-	if (opinfo && opinfo->is_lease) {
-		struct create_context *lease_ccontext;
-
-		ksmbd_debug(SMB, "lease granted on(%s) lease state 0x%x\n",
-			    name, opinfo->o_lease->state);
-		rsp->OplockLevel = SMB2_OPLOCK_LEVEL_LEASE;
-
-		lease_ccontext = (struct create_context *)rsp->Buffer;
-		contxt_cnt++;
-		create_lease_buf(rsp->Buffer, opinfo->o_lease);
-		le32_add_cpu(&rsp->CreateContextsLength,
-			     conn->vals->create_lease_size);
-		iov_len += conn->vals->create_lease_size;
-		next_ptr = &lease_ccontext->Next;
-		next_off = conn->vals->create_lease_size;
-	}
-	opinfo_put(opinfo);
-
-	if (maximal_access_ctxt) {
-		struct create_context *mxac_ccontext;
-
-		if (maximal_access == 0)
-			ksmbd_vfs_query_maximal_access(idmap,
-						       path.dentry,
-						       &maximal_access);
-		mxac_ccontext = (struct create_context *)(rsp->Buffer +
-				le32_to_cpu(rsp->CreateContextsLength));
-		contxt_cnt++;
-		create_mxac_rsp_buf(rsp->Buffer +
-				le32_to_cpu(rsp->CreateContextsLength),
-				le32_to_cpu(maximal_access));
-		le32_add_cpu(&rsp->CreateContextsLength,
-			     conn->vals->create_mxac_size);
-		iov_len += conn->vals->create_mxac_size;
-		if (next_ptr)
-			*next_ptr = cpu_to_le32(next_off);
-		next_ptr = &mxac_ccontext->Next;
-		next_off = conn->vals->create_mxac_size;
-	}
-
-	if (query_disk_id) {
-		struct create_context *disk_id_ccontext;
-
-		disk_id_ccontext = (struct create_context *)(rsp->Buffer +
-				le32_to_cpu(rsp->CreateContextsLength));
-		contxt_cnt++;
-		create_disk_id_rsp_buf(rsp->Buffer +
-				le32_to_cpu(rsp->CreateContextsLength),
-				stat.ino, tcon->id);
-		le32_add_cpu(&rsp->CreateContextsLength,
-			     conn->vals->create_disk_id_size);
-		iov_len += conn->vals->create_disk_id_size;
-		if (next_ptr)
-			*next_ptr = cpu_to_le32(next_off);
-		next_ptr = &disk_id_ccontext->Next;
-		next_off = conn->vals->create_disk_id_size;
-	}
-
-	if (dh_info.type == DURABLE_REQ || dh_info.type == DURABLE_REQ_V2) {
-		struct create_context *durable_ccontext;
-
-		durable_ccontext = (struct create_context *)(rsp->Buffer +
-				le32_to_cpu(rsp->CreateContextsLength));
-		contxt_cnt++;
-		if (dh_info.type == DURABLE_REQ) {
-			create_durable_rsp_buf(rsp->Buffer +
-					le32_to_cpu(rsp->CreateContextsLength));
-			le32_add_cpu(&rsp->CreateContextsLength,
-					conn->vals->create_durable_size);
-			iov_len += conn->vals->create_durable_size;
-		} else {
-			create_durable_v2_rsp_buf(rsp->Buffer +
-					le32_to_cpu(rsp->CreateContextsLength),
-					fp);
-			le32_add_cpu(&rsp->CreateContextsLength,
-					conn->vals->create_durable_v2_size);
-			iov_len += conn->vals->create_durable_v2_size;
-		}
-
-		if (next_ptr)
-			*next_ptr = cpu_to_le32(next_off);
-		next_ptr = &durable_ccontext->Next;
-		next_off = conn->vals->create_durable_size;
-	}
-
-	if (posix_ctxt) {
-		contxt_cnt++;
-		create_posix_rsp_buf(rsp->Buffer +
-				le32_to_cpu(rsp->CreateContextsLength),
-				fp);
-		le32_add_cpu(&rsp->CreateContextsLength,
-			     conn->vals->create_posix_size);
-		iov_len += conn->vals->create_posix_size;
-		if (next_ptr)
-			*next_ptr = cpu_to_le32(next_off);
-	}
-
-	if (contxt_cnt > 0) {
-		rsp->CreateContextsOffset =
-			cpu_to_le32(offsetof(struct smb2_create_rsp, Buffer));
-	}
+	smb2_open_set_rsp(work, rsp, fp, &path, &stat, &dh_info, idmap, name,
+			  file_info, maximal_access_ctxt, maximal_access,
+			  query_disk_id, posix_ctxt, &iov_len);
 
 err_out:
 	if (rc && (file_present || created))
