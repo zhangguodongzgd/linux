@@ -3248,6 +3248,57 @@ static int smb2_parse_posix_create_context(struct ksmbd_work *work,
 	return 0;
 }
 
+static int smb2_open_get_name(struct ksmbd_work *work,
+			      struct smb2_create_req *req,
+			      struct smb2_open_state *state)
+{
+	struct ksmbd_share_config *share = work->tcon->share_conf;
+	int rc;
+
+	if (!req->NameLength) {
+		state->name = kstrdup("", KSMBD_DEFAULT_GFP);
+		if (!state->name)
+			return -ENOMEM;
+		return 0;
+	}
+
+	state->name = smb2_get_name((char *)req + le16_to_cpu(req->NameOffset),
+				    le16_to_cpu(req->NameLength),
+				    work->conn->local_nls);
+	if (IS_ERR(state->name)) {
+		rc = PTR_ERR(state->name);
+		state->name = NULL;
+		return rc;
+	}
+
+	ksmbd_debug(SMB, "converted name = %s\n", state->name);
+
+	if (!state->posix_ctxt) {
+		if (strchr(state->name, ':')) {
+			if (!test_share_config_flag(share,
+						    KSMBD_SHARE_FLAG_STREAMS))
+				return -EBADF;
+
+			rc = parse_stream_name(state->name, &state->stream_name,
+					       &state->s_type);
+			if (rc < 0)
+				return rc;
+		}
+
+		rc = ksmbd_validate_filename(state->name);
+		if (rc < 0)
+			return rc;
+	}
+
+	if (ksmbd_share_veto_filename(share, state->name)) {
+		ksmbd_debug(SMB, "Reject open(), vetoed file: %s\n",
+			    state->name);
+		return -ENOENT;
+	}
+
+	return 0;
+}
+
 /**
  * smb2_open() - handler for smb file open request
  * @work:	smb work containing request buffer
@@ -3296,50 +3347,9 @@ int smb2_open(struct ksmbd_work *work)
 	if (rc)
 		goto err_out2;
 
-	if (req->NameLength) {
-		state.name = smb2_get_name((char *)req + le16_to_cpu(req->NameOffset),
-				     le16_to_cpu(req->NameLength),
-				     work->conn->local_nls);
-		if (IS_ERR(state.name)) {
-			rc = PTR_ERR(state.name);
-			state.name = NULL;
-			goto err_out2;
-		}
-
-		ksmbd_debug(SMB, "converted name = %s\n", state.name);
-
-		if (!state.posix_ctxt) {
-			if (strchr(state.name, ':')) {
-				if (!test_share_config_flag(work->tcon->share_conf,
-							KSMBD_SHARE_FLAG_STREAMS)) {
-					rc = -EBADF;
-					goto err_out2;
-				}
-				rc = parse_stream_name(state.name,
-						       &state.stream_name,
-						       &state.s_type);
-				if (rc < 0)
-					goto err_out2;
-			}
-
-			rc = ksmbd_validate_filename(state.name);
-			if (rc < 0)
-				goto err_out2;
-		}
-
-		if (ksmbd_share_veto_filename(share, state.name)) {
-			rc = -ENOENT;
-			ksmbd_debug(SMB, "Reject open(), vetoed file: %s\n",
-				    state.name);
-			goto err_out2;
-		}
-	} else {
-		state.name = kstrdup("", KSMBD_DEFAULT_GFP);
-		if (!state.name) {
-			rc = -ENOMEM;
-			goto err_out2;
-		}
-	}
+	rc = smb2_open_get_name(work, req, &state);
+	if (rc)
+		goto err_out2;
 
 	state.req_op_level = req->RequestedOplockLevel;
 
