@@ -3299,6 +3299,66 @@ static int smb2_open_get_name(struct ksmbd_work *work,
 	return 0;
 }
 
+static int smb2_validate_create_request(struct smb2_create_req *req,
+					struct smb2_create_rsp *rsp)
+{
+	if (le32_to_cpu(req->ImpersonationLevel) > le32_to_cpu(IL_DELEGATE)) {
+		pr_err("Invalid impersonationlevel : 0x%x\n",
+		       le32_to_cpu(req->ImpersonationLevel));
+		rsp->hdr.Status = STATUS_BAD_IMPERSONATION_LEVEL;
+		return -EIO;
+	}
+
+	if (req->CreateOptions && !(req->CreateOptions & CREATE_OPTIONS_MASK_LE)) {
+		pr_err("Invalid create options : 0x%x\n",
+		       le32_to_cpu(req->CreateOptions));
+		return -EINVAL;
+	}
+
+	if (req->CreateOptions & FILE_SEQUENTIAL_ONLY_LE &&
+	    req->CreateOptions & FILE_RANDOM_ACCESS_LE)
+		req->CreateOptions &= ~FILE_SEQUENTIAL_ONLY_LE;
+
+	if (req->CreateOptions &
+	    (FILE_OPEN_BY_FILE_ID_LE | CREATE_TREE_CONNECTION |
+	     FILE_RESERVE_OPFILTER_LE))
+		return -EOPNOTSUPP;
+
+	if (req->CreateOptions & FILE_DIRECTORY_FILE_LE) {
+		if (req->CreateOptions & FILE_NON_DIRECTORY_FILE_LE)
+			return -EINVAL;
+		if (req->CreateOptions & FILE_NO_COMPRESSION_LE)
+			req->CreateOptions &= ~FILE_NO_COMPRESSION_LE;
+	}
+
+	if (le32_to_cpu(req->CreateDisposition) >
+	    le32_to_cpu(FILE_OVERWRITE_IF_LE)) {
+		pr_err("Invalid create disposition : 0x%x\n",
+		       le32_to_cpu(req->CreateDisposition));
+		return -EINVAL;
+	}
+
+	if (!(req->DesiredAccess & DESIRED_ACCESS_MASK)) {
+		pr_err("Invalid desired access : 0x%x\n",
+		       le32_to_cpu(req->DesiredAccess));
+		return -EACCES;
+	}
+
+	if (req->DesiredAccess == FILE_SYNCHRONIZE_LE &&
+	    req->CreateDisposition == FILE_OPEN_IF_LE &&
+	    !req->FileAttributes)
+		return -EACCES;
+
+	if (req->FileAttributes &&
+	    (req->FileAttributes & ~cpu_to_le32(SMB2_CREATE_FILE_ATTRIBUTE_MASK))) {
+		pr_err("Invalid file attribute : 0x%x\n",
+		       le32_to_cpu(req->FileAttributes));
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 /**
  * smb2_open() - handler for smb file open request
  * @work:	smb work containing request buffer
@@ -3428,70 +3488,9 @@ int smb2_open(struct ksmbd_work *work)
 		}
 	}
 
-	if (le32_to_cpu(req->ImpersonationLevel) > le32_to_cpu(IL_DELEGATE)) {
-		pr_err("Invalid impersonationlevel : 0x%x\n",
-		       le32_to_cpu(req->ImpersonationLevel));
-		rc = -EIO;
-		rsp->hdr.Status = STATUS_BAD_IMPERSONATION_LEVEL;
+	rc = smb2_validate_create_request(req, rsp);
+	if (rc)
 		goto err_out2;
-	}
-
-	if (req->CreateOptions && !(req->CreateOptions & CREATE_OPTIONS_MASK_LE)) {
-		pr_err("Invalid create options : 0x%x\n",
-		       le32_to_cpu(req->CreateOptions));
-		rc = -EINVAL;
-		goto err_out2;
-	} else {
-		if (req->CreateOptions & FILE_SEQUENTIAL_ONLY_LE &&
-		    req->CreateOptions & FILE_RANDOM_ACCESS_LE)
-			req->CreateOptions &= ~FILE_SEQUENTIAL_ONLY_LE;
-
-		if (req->CreateOptions &
-		    (FILE_OPEN_BY_FILE_ID_LE | CREATE_TREE_CONNECTION |
-		     FILE_RESERVE_OPFILTER_LE)) {
-			rc = -EOPNOTSUPP;
-			goto err_out2;
-		}
-
-		if (req->CreateOptions & FILE_DIRECTORY_FILE_LE) {
-			if (req->CreateOptions & FILE_NON_DIRECTORY_FILE_LE) {
-				rc = -EINVAL;
-				goto err_out2;
-			} else if (req->CreateOptions & FILE_NO_COMPRESSION_LE) {
-				req->CreateOptions &= ~FILE_NO_COMPRESSION_LE;
-			}
-		}
-	}
-
-	if (le32_to_cpu(req->CreateDisposition) >
-	    le32_to_cpu(FILE_OVERWRITE_IF_LE)) {
-		pr_err("Invalid create disposition : 0x%x\n",
-		       le32_to_cpu(req->CreateDisposition));
-		rc = -EINVAL;
-		goto err_out2;
-	}
-
-	if (!(req->DesiredAccess & DESIRED_ACCESS_MASK)) {
-		pr_err("Invalid desired access : 0x%x\n",
-		       le32_to_cpu(req->DesiredAccess));
-		rc = -EACCES;
-		goto err_out2;
-	}
-
-	if (req->DesiredAccess == FILE_SYNCHRONIZE_LE &&
-	    req->CreateDisposition == FILE_OPEN_IF_LE &&
-	    !req->FileAttributes) {
-		rc = -EACCES;
-		goto err_out2;
-	}
-
-	if (req->FileAttributes &&
-	    (req->FileAttributes & ~cpu_to_le32(SMB2_CREATE_FILE_ATTRIBUTE_MASK))) {
-		pr_err("Invalid file attribute : 0x%x\n",
-		       le32_to_cpu(req->FileAttributes));
-		rc = -EINVAL;
-		goto err_out2;
-	}
 
 	if (req->CreateContextsOffset) {
 		/* Parse non-durable handle create contexts */
