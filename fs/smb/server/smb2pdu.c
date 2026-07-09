@@ -3405,6 +3405,65 @@ static int smb2_parse_create_contexts(struct smb2_create_req *req,
 	return 0;
 }
 
+static int smb2_lookup_open_path(struct ksmbd_work *work,
+				 struct smb2_create_req *req,
+				 struct smb2_open_state *state)
+{
+	struct ksmbd_tree_connect *tcon = work->tcon;
+	int rc;
+
+	rc = ksmbd_vfs_kern_path(work, state->name, LOOKUP_NO_SYMLINKS,
+				 &state->path, 1);
+
+	/*
+	 * A durable handle opened with delete-on-close is preserved across a
+	 * disconnect so it can be reclaimed by a durable reconnect.  When a new
+	 * delete-on-close open for the same name arrives instead, the
+	 * disconnected handle must give way: close it so its delete-on-close
+	 * removes the file, then re-resolve so this open can create a fresh one.
+	 */
+	if (!rc && (req->CreateOptions & FILE_DELETE_ON_CLOSE_LE) &&
+	    (req->CreateDisposition == FILE_OVERWRITE_IF_LE ||
+	     req->CreateDisposition == FILE_OPEN_IF_LE) &&
+	    ksmbd_close_disconnected_durable_delete_on_close(state->path.dentry)) {
+		path_put(&state->path);
+		rc = ksmbd_vfs_kern_path(work, state->name, LOOKUP_NO_SYMLINKS,
+					 &state->path, 1);
+	}
+
+	if (!rc) {
+		state->file_present = true;
+
+		if (req->CreateOptions & FILE_DELETE_ON_CLOSE_LE) {
+			/*
+			 * If file exists with under flags, return access
+			 * denied error.
+			 */
+			if (req->CreateDisposition == FILE_OVERWRITE_IF_LE ||
+			    req->CreateDisposition == FILE_OPEN_IF_LE)
+				return -EACCES;
+
+			if (!test_tree_conn_flag(tcon,
+						 KSMBD_TREE_CONN_FLAG_WRITABLE)) {
+				ksmbd_debug(SMB,
+					    "User does not have write permission\n");
+				return -EACCES;
+			}
+		} else if (d_is_symlink(state->path.dentry)) {
+			return -EACCES;
+		}
+
+		return 0;
+	}
+
+	if (rc != -ENOENT)
+		return rc;
+
+	ksmbd_debug(SMB, "can not get linux path for %s, rc = %d\n",
+		    state->name, rc);
+	return 0;
+}
+
 /**
  * smb2_open() - handler for smb file open request
  * @work:	smb work containing request buffer
@@ -3419,11 +3478,9 @@ int smb2_open(struct ksmbd_work *work)
 	struct smb2_create_req *req;
 	struct smb2_create_rsp *rsp;
 	struct smb2_open_state state = {};
-	struct path path;
 	struct ksmbd_share_config *share = tcon->share_conf;
 	struct ksmbd_file *fp = NULL;
 	struct file *filp = NULL;
-	struct mnt_idmap *idmap = NULL;
 	struct kstat stat;
 	struct create_context *context;
 	struct lease_ctx_info *lc = NULL;
@@ -3434,7 +3491,7 @@ int smb2_open(struct ksmbd_work *work)
 	int rc = 0;
 	int contxt_cnt = 0, query_disk_id = 0;
 	int next_off = 0;
-	bool file_present = false, created = false, already_permitted = false;
+	bool created = false, already_permitted = false;
 	int share_ret, need_truncate = 0;
 	u64 time, alloc_size = 0;
 	__le32 daccess, maximal_access = 0;
@@ -3545,58 +3602,11 @@ int smb2_open(struct ksmbd_work *work)
 		goto err_out2;
 	}
 
-	rc = ksmbd_vfs_kern_path(work, state.name, LOOKUP_NO_SYMLINKS,
-				 &path, 1);
-
-	/*
-	 * A durable handle opened with delete-on-close is preserved across a
-	 * disconnect so it can be reclaimed by a durable reconnect.  When a new
-	 * delete-on-close open for the same name arrives instead, the
-	 * disconnected handle must give way: close it so its delete-on-close
-	 * removes the file, then re-resolve so this open can create a fresh one.
-	 */
-	if (!rc && (req->CreateOptions & FILE_DELETE_ON_CLOSE_LE) &&
-	    (req->CreateDisposition == FILE_OVERWRITE_IF_LE ||
-	     req->CreateDisposition == FILE_OPEN_IF_LE) &&
-	    ksmbd_close_disconnected_durable_delete_on_close(path.dentry)) {
-		path_put(&path);
-		rc = ksmbd_vfs_kern_path(work, state.name, LOOKUP_NO_SYMLINKS,
-					 &path, 1);
-	}
-
-	if (!rc) {
-		file_present = true;
-
-		if (req->CreateOptions & FILE_DELETE_ON_CLOSE_LE) {
-			/*
-			 * If file exists with under flags, return access
-			 * denied error.
-			 */
-			if (req->CreateDisposition == FILE_OVERWRITE_IF_LE ||
-			    req->CreateDisposition == FILE_OPEN_IF_LE) {
-				rc = -EACCES;
-				goto err_out;
-			}
-
-			if (!test_tree_conn_flag(tcon, KSMBD_TREE_CONN_FLAG_WRITABLE)) {
-				ksmbd_debug(SMB,
-					    "User does not have write permission\n");
-				rc = -EACCES;
-				goto err_out;
-			}
-		} else if (d_is_symlink(path.dentry)) {
-			rc = -EACCES;
-			goto err_out;
-		}
-
-		idmap = mnt_idmap(path.mnt);
-	} else {
-		if (rc != -ENOENT)
-			goto err_out;
-		ksmbd_debug(SMB, "can not get linux path for %s, rc = %d\n",
-			    state.name, rc);
-		rc = 0;
-	}
+	rc = smb2_lookup_open_path(work, req, &state);
+	if (rc)
+		goto err_out;
+	if (state.file_present)
+		state.idmap = mnt_idmap(state.path.mnt);
 
 	/*
 	 * An explicit ::$DATA suffix names the unnamed data stream and is
@@ -3612,7 +3622,7 @@ int smb2_open(struct ksmbd_work *work)
 				rsp->hdr.Status = STATUS_NOT_A_DIRECTORY;
 			}
 		} else {
-			if (file_present && S_ISDIR(d_inode(path.dentry)->i_mode) &&
+			if (state.file_present && S_ISDIR(d_inode(state.path.dentry)->i_mode) &&
 			    state.s_type == DATA_STREAM) {
 				rc = -EIO;
 				rsp->hdr.Status = STATUS_FILE_IS_A_DIRECTORY;
@@ -3629,8 +3639,8 @@ int smb2_open(struct ksmbd_work *work)
 			goto err_out;
 	}
 
-	if (file_present && req->CreateOptions & FILE_NON_DIRECTORY_FILE_LE &&
-	    S_ISDIR(d_inode(path.dentry)->i_mode) &&
+	if (state.file_present && req->CreateOptions & FILE_NON_DIRECTORY_FILE_LE &&
+	    S_ISDIR(d_inode(state.path.dentry)->i_mode) &&
 	    !(req->CreateOptions & FILE_DELETE_ON_CLOSE_LE)) {
 		ksmbd_debug(SMB, "open() argument is a directory: %s, %x\n",
 			    state.name, req->CreateOptions);
@@ -3639,15 +3649,15 @@ int smb2_open(struct ksmbd_work *work)
 		goto err_out;
 	}
 
-	if (file_present && (req->CreateOptions & FILE_DIRECTORY_FILE_LE) &&
+	if (state.file_present && (req->CreateOptions & FILE_DIRECTORY_FILE_LE) &&
 	    !(req->CreateDisposition == FILE_CREATE_LE) &&
-	    !S_ISDIR(d_inode(path.dentry)->i_mode)) {
+	    !S_ISDIR(d_inode(state.path.dentry)->i_mode)) {
 		rsp->hdr.Status = STATUS_NOT_A_DIRECTORY;
 		rc = -EIO;
 		goto err_out;
 	}
 
-	if (!state.stream_name && file_present &&
+	if (!state.stream_name && state.file_present &&
 	    req->CreateDisposition == FILE_CREATE_LE) {
 		rc = -EEXIST;
 		goto err_out;
@@ -3655,30 +3665,31 @@ int smb2_open(struct ksmbd_work *work)
 
 	daccess = smb_map_generic_desired_access(req->DesiredAccess);
 
-	if (file_present && !(req->CreateOptions & FILE_DELETE_ON_CLOSE_LE)) {
-		rc = smb_check_perm_dacl(conn, &path, &daccess,
+	if (state.file_present && !(req->CreateOptions & FILE_DELETE_ON_CLOSE_LE)) {
+		rc = smb_check_perm_dacl(conn, &state.path, &daccess,
 					 sess->user->uid);
 		if (rc)
 			goto err_out;
 	}
 
 	if (daccess & FILE_MAXIMAL_ACCESS_LE) {
-		if (!file_present) {
+		if (!state.file_present) {
 			daccess = cpu_to_le32(GENERIC_ALL_FLAGS);
 		} else {
-			ksmbd_vfs_query_maximal_access(idmap,
-							    path.dentry,
-							    &daccess);
+			ksmbd_vfs_query_maximal_access(state.idmap,
+						       state.path.dentry,
+						       &daccess);
 			already_permitted = true;
 		}
 		maximal_access = daccess;
 	}
 
-	open_flags = smb2_create_open_flags(file_present, daccess,
+	open_flags = smb2_create_open_flags(state.file_present, daccess,
 					    req->CreateDisposition,
 					    &may_flags,
 					    req->CreateOptions,
-					    file_present ? d_inode(path.dentry)->i_mode : 0);
+					    state.file_present ?
+					    d_inode(state.path.dentry)->i_mode : 0);
 
 	if (!test_tree_conn_flag(tcon, KSMBD_TREE_CONN_FLAG_WRITABLE)) {
 		if (open_flags & (O_CREAT | O_TRUNC)) {
@@ -3690,8 +3701,8 @@ int smb2_open(struct ksmbd_work *work)
 	}
 
 	/*create file if not present */
-	if (!file_present) {
-		rc = smb2_creat(work, &path, state.name, open_flags,
+	if (!state.file_present) {
+		rc = smb2_creat(work, &state.path, state.name, open_flags,
 				state.posix_mode,
 				req->CreateOptions & FILE_DIRECTORY_FILE_LE);
 		if (rc) {
@@ -3703,7 +3714,7 @@ int smb2_open(struct ksmbd_work *work)
 		}
 
 		created = true;
-		idmap = mnt_idmap(path.mnt);
+		state.idmap = mnt_idmap(state.path.mnt);
 		if (state.ea_buf) {
 			if (le32_to_cpu(state.ea_buf->ccontext.DataLength) <
 			    sizeof(struct smb2_ea_info)) {
@@ -3713,7 +3724,7 @@ int smb2_open(struct ksmbd_work *work)
 
 			rc = smb2_set_ea(&state.ea_buf->ea,
 					 le32_to_cpu(state.ea_buf->ccontext.DataLength),
-					 &path, false);
+					 &state.path, false);
 			if (rc == -EOPNOTSUPP)
 				rc = 0;
 			else if (rc)
@@ -3725,16 +3736,16 @@ int smb2_open(struct ksmbd_work *work)
 		 * is already granted.
 		 */
 		if (daccess & ~(FILE_READ_ATTRIBUTES_LE | FILE_READ_CONTROL_LE)) {
-			rc = inode_permission(idmap,
-					      d_inode(path.dentry),
+			rc = inode_permission(state.idmap,
+					      d_inode(state.path.dentry),
 					      may_flags);
 			if (rc)
 				goto err_out;
 
 			if ((daccess & FILE_DELETE_LE) ||
 			    (req->CreateOptions & FILE_DELETE_ON_CLOSE_LE)) {
-				rc = inode_permission(idmap,
-						      d_inode(path.dentry->d_parent),
+				rc = inode_permission(state.idmap,
+						      d_inode(state.path.dentry->d_parent),
 						      MAY_EXEC | MAY_WRITE);
 				if (rc)
 					goto err_out;
@@ -3742,21 +3753,21 @@ int smb2_open(struct ksmbd_work *work)
 		}
 	}
 
-	rc = ksmbd_query_inode_status(path.dentry->d_parent);
+	rc = ksmbd_query_inode_status(state.path.dentry->d_parent);
 	if (rc == KSMBD_INODE_STATUS_PENDING_DELETE) {
 		rc = -EBUSY;
 		goto err_out;
 	}
 
 	rc = 0;
-	filp = dentry_open(&path, open_flags, current_cred());
+	filp = dentry_open(&state.path, open_flags, current_cred());
 	if (IS_ERR(filp)) {
 		rc = PTR_ERR(filp);
 		pr_err("dentry open for dir failed, rc %d\n", rc);
 		goto err_out;
 	}
 
-	if (file_present) {
+	if (state.file_present) {
 		if (!(open_flags & O_TRUNC))
 			file_info = FILE_OPENED;
 		else
@@ -3795,28 +3806,28 @@ int smb2_open(struct ksmbd_work *work)
 	/* Set default windows and posix acls if creating new file */
 	if (created) {
 		int posix_acl_rc;
-		struct inode *inode = d_inode(path.dentry);
+		struct inode *inode = d_inode(state.path.dentry);
 
-		posix_acl_rc = ksmbd_vfs_inherit_posix_acl(idmap,
-							   &path,
-							   d_inode(path.dentry->d_parent));
+		posix_acl_rc = ksmbd_vfs_inherit_posix_acl(state.idmap,
+							   &state.path,
+							   d_inode(state.path.dentry->d_parent));
 		if (posix_acl_rc)
 			ksmbd_debug(SMB, "inherit posix acl failed : %d\n", posix_acl_rc);
 
-		rc = smb2_create_sd_buffer(work, req, &path);
+		rc = smb2_create_sd_buffer(work, req, &state.path);
 		if (rc && rc != -ENOENT)
 			goto err_out;
 
 		if (rc == -ENOENT) {
 			if (test_share_config_flag(work->tcon->share_conf,
 						   KSMBD_SHARE_FLAG_ACL_XATTR)) {
-				rc = smb_inherit_dacl(conn, &path, sess->user->uid,
+				rc = smb_inherit_dacl(conn, &state.path, sess->user->uid,
 						      sess->user->gid);
 			}
 			if (rc) {
 				if (posix_acl_rc)
-					ksmbd_vfs_set_init_posix_acl(idmap,
-								     &path);
+					ksmbd_vfs_set_init_posix_acl(state.idmap,
+								     &state.path);
 
 				if (test_share_config_flag(work->tcon->share_conf,
 							   KSMBD_SHARE_FLAG_ACL_XATTR)) {
@@ -3825,7 +3836,7 @@ int smb2_open(struct ksmbd_work *work)
 					int pntsd_size;
 					size_t scratch_len;
 
-					ksmbd_acls_fattr(&fattr, idmap, inode);
+					ksmbd_acls_fattr(&fattr, state.idmap, inode);
 					scratch_len = smb_acl_sec_desc_scratch_len(&fattr,
 							NULL, 0,
 							OWNER_SECINFO | GROUP_SECINFO |
@@ -3845,7 +3856,7 @@ int smb2_open(struct ksmbd_work *work)
 						goto err_out;
 					}
 
-					rc = build_sec_desc(idmap,
+					rc = build_sec_desc(state.idmap,
 							    pntsd, NULL, 0,
 							    OWNER_SECINFO |
 							    GROUP_SECINFO |
@@ -3859,8 +3870,8 @@ int smb2_open(struct ksmbd_work *work)
 					}
 
 					rc = ksmbd_vfs_set_sd_xattr(conn,
-								    idmap,
-								    &path,
+								    state.idmap,
+								    &state.path,
 								    pntsd,
 								    pntsd_size,
 								    false);
@@ -3875,7 +3886,7 @@ int smb2_open(struct ksmbd_work *work)
 	}
 
 	if (state.stream_name) {
-		rc = smb2_set_stream_name_xattr(&path,
+		rc = smb2_set_stream_name_xattr(&state.path,
 						fp,
 						state.stream_name,
 						state.s_type);
@@ -3909,8 +3920,8 @@ int smb2_open(struct ksmbd_work *work)
 		goto err_out;
 	}
 
-	if (file_present || created)
-		path_put(&path);
+	if (state.file_present || created)
+		path_put(&state.path);
 
 	if (!S_ISDIR(file_inode(filp)->i_mode) && open_flags & O_TRUNC &&
 	    !fp->attrib_only && !state.stream_name) {
@@ -4020,7 +4031,7 @@ int smb2_open(struct ksmbd_work *work)
 		}
 	}
 
-	rc = ksmbd_vfs_getattr(&path, &stat);
+	rc = ksmbd_vfs_getattr(&state.path, &stat);
 	if (rc)
 		goto err_out1;
 
@@ -4036,12 +4047,12 @@ int smb2_open(struct ksmbd_work *work)
 			cpu_to_le32(smb2_get_dos_mode(&stat, le32_to_cpu(req->FileAttributes)));
 
 	if (!created)
-		smb2_update_xattrs(tcon, &path, fp);
+		smb2_update_xattrs(tcon, &state.path, fp);
 
-	ksmbd_vfs_update_compressed_fattr(path.dentry, &fp->f_ci->m_fattr);
+	ksmbd_vfs_update_compressed_fattr(state.path.dentry, &fp->f_ci->m_fattr);
 
 	if (created)
-		smb2_new_xattrs(tcon, &path, fp);
+		smb2_new_xattrs(tcon, &state.path, fp);
 
 	memcpy(fp->client_guid, conn->ClientGUID, SMB2_CLIENT_GUID_SIZE);
 
@@ -4130,8 +4141,8 @@ reconnected_fp:
 		struct create_context *mxac_ccontext;
 
 		if (maximal_access == 0)
-			ksmbd_vfs_query_maximal_access(idmap,
-						       path.dentry,
+			ksmbd_vfs_query_maximal_access(state.idmap,
+						       state.path.dentry,
 						       &maximal_access);
 		mxac_ccontext = (struct create_context *)(rsp->Buffer +
 				le32_to_cpu(rsp->CreateContextsLength));
@@ -4211,8 +4222,8 @@ reconnected_fp:
 	}
 
 err_out:
-	if (rc && (file_present || created))
-		path_put(&path);
+	if (rc && (state.file_present || created))
+		path_put(&state.path);
 
 err_out1:
 	ksmbd_revert_fsids(work);
