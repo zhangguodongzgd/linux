@@ -3567,6 +3567,145 @@ static int smb2_validate_stream_options(struct smb2_create_req *req,
 	return 0;
 }
 
+static int smb2_prepare_open_file(struct ksmbd_work *work,
+				  struct smb2_create_req *req,
+				  struct smb2_create_rsp *rsp,
+				  struct path *path,
+				  char *name,
+				  char *stream_name,
+				  int s_type,
+				  struct create_ea_buf_req *ea_buf,
+				  umode_t posix_mode,
+				  bool file_present,
+				  bool *created,
+				  struct mnt_idmap **idmap,
+				  __le32 *daccess,
+				  __le32 *maximal_access,
+				  int *open_flags)
+{
+	struct ksmbd_conn *conn = work->conn;
+	struct ksmbd_session *sess = work->sess;
+	struct ksmbd_tree_connect *tcon = work->tcon;
+	bool already_permitted = false;
+	int may_flags = 0;
+	int rc;
+
+	rc = smb2_validate_stream_options(req, rsp, path, file_present,
+					  stream_name, s_type);
+	if (rc)
+		return rc;
+
+	if (file_present && req->CreateOptions & FILE_NON_DIRECTORY_FILE_LE &&
+	    S_ISDIR(d_inode(path->dentry)->i_mode) &&
+	    !(req->CreateOptions & FILE_DELETE_ON_CLOSE_LE)) {
+		ksmbd_debug(SMB, "open() argument is a directory: %s, %x\n",
+			    name, req->CreateOptions);
+		rsp->hdr.Status = STATUS_FILE_IS_A_DIRECTORY;
+		return -EIO;
+	}
+
+	if (file_present && (req->CreateOptions & FILE_DIRECTORY_FILE_LE) &&
+	    !(req->CreateDisposition == FILE_CREATE_LE) &&
+	    !S_ISDIR(d_inode(path->dentry)->i_mode)) {
+		rsp->hdr.Status = STATUS_NOT_A_DIRECTORY;
+		return -EIO;
+	}
+
+	if (!stream_name && file_present &&
+	    req->CreateDisposition == FILE_CREATE_LE)
+		return -EEXIST;
+
+	*daccess = smb_map_generic_desired_access(req->DesiredAccess);
+
+	if (file_present && !(req->CreateOptions & FILE_DELETE_ON_CLOSE_LE)) {
+		rc = smb_check_perm_dacl(conn, path, daccess, sess->user->uid);
+		if (rc)
+			return rc;
+	}
+
+	if (*daccess & FILE_MAXIMAL_ACCESS_LE) {
+		if (!file_present) {
+			*daccess = cpu_to_le32(GENERIC_ALL_FLAGS);
+		} else {
+			ksmbd_vfs_query_maximal_access(*idmap, path->dentry,
+						       daccess);
+			already_permitted = true;
+		}
+		*maximal_access = *daccess;
+	}
+
+	*open_flags = smb2_create_open_flags(file_present, *daccess,
+					     req->CreateDisposition,
+					     &may_flags,
+					     req->CreateOptions,
+					     file_present ?
+					     d_inode(path->dentry)->i_mode : 0);
+
+	if (!test_tree_conn_flag(tcon, KSMBD_TREE_CONN_FLAG_WRITABLE)) {
+		if (*open_flags & (O_CREAT | O_TRUNC)) {
+			ksmbd_debug(SMB,
+				    "User does not have write permission\n");
+			return -EACCES;
+		}
+	}
+
+	/* create file if not present */
+	if (!file_present) {
+		rc = smb2_creat(work, path, name, *open_flags, posix_mode,
+				req->CreateOptions & FILE_DIRECTORY_FILE_LE);
+		if (rc) {
+			if (rc == -ENOENT) {
+				rsp->hdr.Status = STATUS_OBJECT_PATH_NOT_FOUND;
+				return -EIO;
+			}
+			return rc;
+		}
+
+		*created = true;
+		*idmap = mnt_idmap(path->mnt);
+		if (ea_buf) {
+			if (le32_to_cpu(ea_buf->ccontext.DataLength) <
+			    sizeof(struct smb2_ea_info))
+				return -EINVAL;
+
+			rc = smb2_set_ea(&ea_buf->ea,
+					 le32_to_cpu(ea_buf->ccontext.DataLength),
+					 path, false);
+			if (rc == -EOPNOTSUPP)
+				rc = 0;
+			else if (rc)
+				return rc;
+		}
+	} else if (!already_permitted) {
+		/*
+		 * FILE_READ_ATTRIBUTE is allowed without inode_permission because
+		 * execute(search) permission on a parent directory is already
+		 * granted.
+		 */
+		if (*daccess & ~(FILE_READ_ATTRIBUTES_LE | FILE_READ_CONTROL_LE)) {
+			rc = inode_permission(*idmap, d_inode(path->dentry),
+					      may_flags);
+			if (rc)
+				return rc;
+
+			if ((*daccess & FILE_DELETE_LE) ||
+			    (req->CreateOptions & FILE_DELETE_ON_CLOSE_LE)) {
+				rc = inode_permission(*idmap,
+						      d_inode(path->dentry->d_parent),
+						      MAY_EXEC | MAY_WRITE);
+				if (rc)
+					return rc;
+			}
+		}
+	}
+
+	rc = ksmbd_query_inode_status(path->dentry->d_parent);
+	if (rc == KSMBD_INODE_STATUS_PENDING_DELETE)
+		return -EBUSY;
+
+	return 0;
+}
+
 static int smb2_create_inherit_acls(struct ksmbd_work *work,
 				    struct smb2_create_req *req,
 				    struct path *path,
@@ -3887,14 +4026,14 @@ int smb2_open(struct ksmbd_work *work)
 	struct lease_ctx_info *lc = NULL;
 	struct create_ea_buf_req *ea_buf = NULL;
 	struct durable_info dh_info = {0};
-	int req_op_level = 0, open_flags = 0, may_flags = 0, file_info = 0;
+	int req_op_level = 0, open_flags = 0, file_info = 0;
 	int rc = 0;
 	int query_disk_id = 0;
 	bool maximal_access_ctxt = false, posix_ctxt = false, reconnected = false;
 	int s_type = 0;
 	char *name = NULL;
 	char *stream_name = NULL;
-	bool file_present = false, created = false, already_permitted = false;
+	bool file_present = false, created = false;
 	int share_ret, need_truncate = 0;
 	u64 alloc_size = 0;
 	umode_t posix_mode = 0;
@@ -3956,129 +4095,12 @@ int smb2_open(struct ksmbd_work *work)
 	if (file_present)
 		idmap = mnt_idmap(path.mnt);
 
-	rc = smb2_validate_stream_options(req, rsp, &path, file_present,
-					  stream_name, s_type);
+	rc = smb2_prepare_open_file(work, req, rsp, &path, name, stream_name,
+				    s_type, ea_buf, posix_mode, file_present,
+				    &created, &idmap, &daccess,
+				    &maximal_access, &open_flags);
 	if (rc)
 		goto err_out;
-
-	if (file_present && req->CreateOptions & FILE_NON_DIRECTORY_FILE_LE &&
-	    S_ISDIR(d_inode(path.dentry)->i_mode) &&
-	    !(req->CreateOptions & FILE_DELETE_ON_CLOSE_LE)) {
-		ksmbd_debug(SMB, "open() argument is a directory: %s, %x\n",
-			    name, req->CreateOptions);
-		rsp->hdr.Status = STATUS_FILE_IS_A_DIRECTORY;
-		rc = -EIO;
-		goto err_out;
-	}
-
-	if (file_present && (req->CreateOptions & FILE_DIRECTORY_FILE_LE) &&
-	    !(req->CreateDisposition == FILE_CREATE_LE) &&
-	    !S_ISDIR(d_inode(path.dentry)->i_mode)) {
-		rsp->hdr.Status = STATUS_NOT_A_DIRECTORY;
-		rc = -EIO;
-		goto err_out;
-	}
-
-	if (!stream_name && file_present &&
-	    req->CreateDisposition == FILE_CREATE_LE) {
-		rc = -EEXIST;
-		goto err_out;
-	}
-
-	daccess = smb_map_generic_desired_access(req->DesiredAccess);
-
-	if (file_present && !(req->CreateOptions & FILE_DELETE_ON_CLOSE_LE)) {
-		rc = smb_check_perm_dacl(conn, &path, &daccess,
-					 sess->user->uid);
-		if (rc)
-			goto err_out;
-	}
-
-	if (daccess & FILE_MAXIMAL_ACCESS_LE) {
-		if (!file_present) {
-			daccess = cpu_to_le32(GENERIC_ALL_FLAGS);
-		} else {
-			ksmbd_vfs_query_maximal_access(idmap,
-							    path.dentry,
-							    &daccess);
-			already_permitted = true;
-		}
-		maximal_access = daccess;
-	}
-
-	open_flags = smb2_create_open_flags(file_present, daccess,
-					    req->CreateDisposition,
-					    &may_flags,
-					    req->CreateOptions,
-					    file_present ? d_inode(path.dentry)->i_mode : 0);
-
-	if (!test_tree_conn_flag(tcon, KSMBD_TREE_CONN_FLAG_WRITABLE)) {
-		if (open_flags & (O_CREAT | O_TRUNC)) {
-			ksmbd_debug(SMB,
-				    "User does not have write permission\n");
-			rc = -EACCES;
-			goto err_out;
-		}
-	}
-
-	/*create file if not present */
-	if (!file_present) {
-		rc = smb2_creat(work, &path, name, open_flags,
-				posix_mode,
-				req->CreateOptions & FILE_DIRECTORY_FILE_LE);
-		if (rc) {
-			if (rc == -ENOENT) {
-				rc = -EIO;
-				rsp->hdr.Status = STATUS_OBJECT_PATH_NOT_FOUND;
-			}
-			goto err_out;
-		}
-
-		created = true;
-		idmap = mnt_idmap(path.mnt);
-		if (ea_buf) {
-			if (le32_to_cpu(ea_buf->ccontext.DataLength) <
-			    sizeof(struct smb2_ea_info)) {
-				rc = -EINVAL;
-				goto err_out;
-			}
-
-			rc = smb2_set_ea(&ea_buf->ea,
-					 le32_to_cpu(ea_buf->ccontext.DataLength),
-					 &path, false);
-			if (rc == -EOPNOTSUPP)
-				rc = 0;
-			else if (rc)
-				goto err_out;
-		}
-	} else if (!already_permitted) {
-		/* FILE_READ_ATTRIBUTE is allowed without inode_permission,
-		 * because execute(search) permission on a parent directory,
-		 * is already granted.
-		 */
-		if (daccess & ~(FILE_READ_ATTRIBUTES_LE | FILE_READ_CONTROL_LE)) {
-			rc = inode_permission(idmap,
-					      d_inode(path.dentry),
-					      may_flags);
-			if (rc)
-				goto err_out;
-
-			if ((daccess & FILE_DELETE_LE) ||
-			    (req->CreateOptions & FILE_DELETE_ON_CLOSE_LE)) {
-				rc = inode_permission(idmap,
-						      d_inode(path.dentry->d_parent),
-						      MAY_EXEC | MAY_WRITE);
-				if (rc)
-					goto err_out;
-			}
-		}
-	}
-
-	rc = ksmbd_query_inode_status(path.dentry->d_parent);
-	if (rc == KSMBD_INODE_STATUS_PENDING_DELETE) {
-		rc = -EBUSY;
-		goto err_out;
-	}
 
 	rc = 0;
 	filp = dentry_open(&path, open_flags, current_cred());
