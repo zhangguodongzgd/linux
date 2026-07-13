@@ -3786,6 +3786,95 @@ static int smb2_create_inherit_acls(struct ksmbd_work *work,
 	return 0;
 }
 
+static int smb2_open_file(struct ksmbd_work *work,
+			  struct smb2_create_req *req,
+			  struct path *path,
+			  struct mnt_idmap *idmap,
+			  bool file_present,
+			  bool created,
+			  int open_flags,
+			  __le32 daccess,
+			  bool posix_ctxt,
+			  char *stream_name,
+			  int s_type,
+			  struct ksmbd_file **fp,
+			  int *file_info)
+{
+	struct file *filp;
+	int rc;
+
+	filp = dentry_open(path, open_flags, current_cred());
+	if (IS_ERR(filp)) {
+		rc = PTR_ERR(filp);
+		pr_err("dentry open for dir failed, rc %d\n", rc);
+		return rc;
+	}
+
+	if (file_present) {
+		if (!(open_flags & O_TRUNC))
+			*file_info = FILE_OPENED;
+		else
+			*file_info = FILE_OVERWRITTEN;
+
+		if ((req->CreateDisposition & FILE_CREATE_MASK_LE) ==
+		    FILE_SUPERSEDE_LE)
+			*file_info = FILE_SUPERSEDED;
+	} else if (open_flags & O_CREAT) {
+		*file_info = FILE_CREATED;
+	}
+
+	ksmbd_vfs_set_fadvise(filp, req->CreateOptions);
+
+	/* Obtain Volatile-ID */
+	*fp = ksmbd_open_fd(work, filp);
+	if (IS_ERR(*fp)) {
+		fput(filp);
+		rc = PTR_ERR(*fp);
+		*fp = NULL;
+		return rc;
+	}
+
+	/* Get Persistent-ID */
+	ksmbd_open_durable_fd(*fp);
+	if (!has_file_id((*fp)->persistent_id))
+		return -ENOMEM;
+
+	(*fp)->cdoption = req->CreateDisposition;
+	(*fp)->daccess = daccess;
+	(*fp)->saccess = req->ShareAccess;
+	(*fp)->coption = req->CreateOptions;
+
+	/* Set default windows and posix acls if creating new file */
+	if (created) {
+		rc = smb2_create_inherit_acls(work, req, path, idmap);
+		if (rc)
+			return rc;
+	}
+
+	if (stream_name) {
+		rc = smb2_set_stream_name_xattr(path, *fp, stream_name, s_type);
+		if (rc)
+			return rc;
+		*file_info = FILE_CREATED;
+	}
+
+	(*fp)->attrib_only = !(req->DesiredAccess &
+			~(FILE_READ_ATTRIBUTES_LE | FILE_WRITE_ATTRIBUTES_LE |
+			  FILE_SYNCHRONIZE_LE));
+
+	(*fp)->is_posix_ctxt = posix_ctxt;
+
+	/*
+	 * fp should be searchable through ksmbd_inode.m_fp_list after daccess,
+	 * saccess, attrib_only, and stream are initialized.
+	 */
+	down_write(&(*fp)->f_ci->m_lock);
+	list_add(&(*fp)->node, &(*fp)->f_ci->m_fp_list);
+	up_write(&(*fp)->f_ci->m_lock);
+
+	return 0;
+}
+
 static int smb2_apply_create_contexts(struct ksmbd_work *work,
 				      struct smb2_create_req *req,
 				      struct ksmbd_file *fp,
@@ -4013,14 +4102,12 @@ static void smb2_open_set_rsp(struct ksmbd_work *work,
 int smb2_open(struct ksmbd_work *work)
 {
 	struct ksmbd_conn *conn = work->conn;
-	struct ksmbd_session *sess = work->sess;
 	struct ksmbd_tree_connect *tcon = work->tcon;
 	struct smb2_create_req *req;
 	struct smb2_create_rsp *rsp;
 	struct path path;
 	struct ksmbd_share_config *share = tcon->share_conf;
 	struct ksmbd_file *fp = NULL;
-	struct file *filp = NULL;
 	struct mnt_idmap *idmap = NULL;
 	struct kstat stat;
 	struct lease_ctx_info *lc = NULL;
@@ -4102,79 +4189,11 @@ int smb2_open(struct ksmbd_work *work)
 	if (rc)
 		goto err_out;
 
-	rc = 0;
-	filp = dentry_open(&path, open_flags, current_cred());
-	if (IS_ERR(filp)) {
-		rc = PTR_ERR(filp);
-		pr_err("dentry open for dir failed, rc %d\n", rc);
+	rc = smb2_open_file(work, req, &path, idmap, file_present, created,
+			    open_flags, daccess, posix_ctxt, stream_name,
+			    s_type, &fp, &file_info);
+	if (rc)
 		goto err_out;
-	}
-
-	if (file_present) {
-		if (!(open_flags & O_TRUNC))
-			file_info = FILE_OPENED;
-		else
-			file_info = FILE_OVERWRITTEN;
-
-		if ((req->CreateDisposition & FILE_CREATE_MASK_LE) ==
-		    FILE_SUPERSEDE_LE)
-			file_info = FILE_SUPERSEDED;
-	} else if (open_flags & O_CREAT) {
-		file_info = FILE_CREATED;
-	}
-
-	ksmbd_vfs_set_fadvise(filp, req->CreateOptions);
-
-	/* Obtain Volatile-ID */
-	fp = ksmbd_open_fd(work, filp);
-	if (IS_ERR(fp)) {
-		fput(filp);
-		rc = PTR_ERR(fp);
-		fp = NULL;
-		goto err_out;
-	}
-
-	/* Get Persistent-ID */
-	ksmbd_open_durable_fd(fp);
-	if (!has_file_id(fp->persistent_id)) {
-		rc = -ENOMEM;
-		goto err_out;
-	}
-
-	fp->cdoption = req->CreateDisposition;
-	fp->daccess = daccess;
-	fp->saccess = req->ShareAccess;
-	fp->coption = req->CreateOptions;
-
-	/* Set default windows and posix acls if creating new file */
-	if (created) {
-		rc = smb2_create_inherit_acls(work, req, &path, idmap);
-		if (rc)
-			goto err_out;
-	}
-
-	if (stream_name) {
-		rc = smb2_set_stream_name_xattr(&path,
-						fp,
-						stream_name,
-						s_type);
-		if (rc)
-			goto err_out;
-		file_info = FILE_CREATED;
-	}
-
-	fp->attrib_only = !(req->DesiredAccess & ~(FILE_READ_ATTRIBUTES_LE |
-			FILE_WRITE_ATTRIBUTES_LE | FILE_SYNCHRONIZE_LE));
-
-	fp->is_posix_ctxt = posix_ctxt;
-
-	/* fp should be searchable through ksmbd_inode.m_fp_list
-	 * after daccess, saccess, attrib_only, and stream are
-	 * initialized.
-	 */
-	down_write(&fp->f_ci->m_lock);
-	list_add(&fp->node, &fp->f_ci->m_fp_list);
-	up_write(&fp->f_ci->m_lock);
 
 	/* Check delete pending among previous fp before oplock break */
 	if (ksmbd_inode_pending_delete(fp)) {
@@ -4191,7 +4210,7 @@ int smb2_open(struct ksmbd_work *work)
 	if (file_present || created)
 		path_put(&path);
 
-	if (!S_ISDIR(file_inode(filp)->i_mode) && open_flags & O_TRUNC &&
+	if (!S_ISDIR(file_inode(fp->filp)->i_mode) && open_flags & O_TRUNC &&
 	    !fp->attrib_only && !stream_name) {
 		smb_break_all_oplock(work, fp);
 		need_truncate = 1;
@@ -4207,7 +4226,7 @@ int smb2_open(struct ksmbd_work *work)
 		}
 	} else {
 		if (req_op_level == SMB2_OPLOCK_LEVEL_LEASE && lc) {
-			if (S_ISDIR(file_inode(filp)->i_mode)) {
+			if (S_ISDIR(file_inode(fp->filp)->i_mode)) {
 				lc->req_state &= ~SMB2_LEASE_WRITE_CACHING_LE;
 				lc->is_dir = true;
 			}
