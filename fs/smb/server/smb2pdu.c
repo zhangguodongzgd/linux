@@ -3299,6 +3299,90 @@ static int smb2_open_get_name(struct ksmbd_work *work,
 	return 0;
 }
 
+static int smb2_open_parse_durable(struct ksmbd_work *work,
+				   struct smb2_create_req *req,
+				   struct smb2_open_state *state)
+{
+	struct ksmbd_conn *conn = work->conn;
+	struct ksmbd_share_config *share = work->tcon->share_conf;
+	struct ksmbd_session *sess = work->sess;
+	int rc;
+
+	state->req_op_level = req->RequestedOplockLevel;
+
+	if (server_conf.flags & KSMBD_GLOBAL_FLAG_DURABLE_HANDLE &&
+	    req->CreateContextsOffset) {
+		state->lc = parse_lease_state(req);
+		if (IS_ERR(state->lc)) {
+			rc = PTR_ERR(state->lc);
+			state->lc = NULL;
+			return rc;
+		}
+		if (state->lc && state->lc->version == 2 &&
+		    conn->dialect < SMB30_PROT_ID) {
+			kfree(state->lc);
+			state->lc = NULL;
+			if (state->req_op_level == SMB2_OPLOCK_LEVEL_LEASE)
+				state->req_op_level = SMB2_OPLOCK_LEVEL_NONE;
+		}
+
+		rc = parse_durable_handle_context(work, req, state->lc,
+						  &state->dh_info);
+		if (rc) {
+			ksmbd_debug(SMB, "error parsing durable handle context\n");
+			return rc;
+		}
+
+		rc = parse_app_instance_id(req, &state->dh_info);
+		if (rc)
+			return rc;
+
+		if (state->dh_info.reconnected) {
+			rc = smb2_check_durable_oplock(conn, share,
+						       state->dh_info.fp,
+						       state->lc, sess->user,
+						       state->name);
+			if (rc)
+				return rc;
+
+			rc = ksmbd_reopen_durable_fd(work, state->dh_info.fp);
+			if (rc)
+				return rc;
+
+			if (ksmbd_override_fsids(work))
+				return -ENOMEM;
+
+			state->file_info = FILE_OPENED;
+
+			rc = ksmbd_vfs_getattr(&state->dh_info.fp->filp->f_path,
+					       &state->stat);
+			if (rc)
+				return rc;
+
+			return 0;
+		}
+
+		if (state->dh_info.type == DURABLE_REQ_V2 &&
+		    state->dh_info.app_instance_id)
+			ksmbd_close_fd_app_instance_id(state->dh_info.AppInstanceId);
+	} else if (state->req_op_level == SMB2_OPLOCK_LEVEL_LEASE) {
+		state->lc = parse_lease_state(req);
+		if (IS_ERR(state->lc)) {
+			rc = PTR_ERR(state->lc);
+			state->lc = NULL;
+			return rc;
+		}
+		if (state->lc && state->lc->version == 2 &&
+		    conn->dialect < SMB30_PROT_ID) {
+			kfree(state->lc);
+			state->lc = NULL;
+			state->req_op_level = SMB2_OPLOCK_LEVEL_NONE;
+		}
+	}
+
+	return 0;
+}
+
 static int smb2_validate_create_request(struct smb2_create_req *req,
 					struct smb2_create_rsp *rsp)
 {
@@ -3808,8 +3892,7 @@ int smb2_open(struct ksmbd_work *work)
 	struct ksmbd_share_config *share = tcon->share_conf;
 	struct ksmbd_file *fp = NULL;
 	struct file *filp = NULL;
-	struct lease_ctx_info *lc = NULL;
-	int req_op_level = 0, open_flags = 0, may_flags = 0;
+	int open_flags = 0, may_flags = 0;
 	int rc = 0;
 	bool created = false, already_permitted = false;
 	int share_ret, need_truncate = 0;
@@ -3840,72 +3923,12 @@ int smb2_open(struct ksmbd_work *work)
 	if (rc)
 		goto err_out2;
 
-	req_op_level = req->RequestedOplockLevel;
-
-	if (server_conf.flags & KSMBD_GLOBAL_FLAG_DURABLE_HANDLE &&
-	    req->CreateContextsOffset) {
-		lc = parse_lease_state(req);
-		if (IS_ERR(lc)) {
-			rc = PTR_ERR(lc);
-			lc = NULL;
-			goto err_out2;
-		}
-		if (lc && lc->version == 2 && conn->dialect < SMB30_PROT_ID) {
-			kfree(lc);
-			lc = NULL;
-			if (req_op_level == SMB2_OPLOCK_LEVEL_LEASE)
-				req_op_level = SMB2_OPLOCK_LEVEL_NONE;
-		}
-		rc = parse_durable_handle_context(work, req, lc, &state.dh_info);
-		if (rc) {
-			ksmbd_debug(SMB, "error parsing durable handle context\n");
-			goto err_out2;
-		}
-		rc = parse_app_instance_id(req, &state.dh_info);
-		if (rc)
-			goto err_out2;
-
-		if (state.dh_info.reconnected) {
-			rc = smb2_check_durable_oplock(conn, share,
-						       state.dh_info.fp, lc,
-						       sess->user, state.name);
-			if (rc)
-				goto err_out2;
-
-			rc = ksmbd_reopen_durable_fd(work, state.dh_info.fp);
-			if (rc)
-				goto err_out2;
-
-			fp = state.dh_info.fp;
-
-			if (ksmbd_override_fsids(work)) {
-				rc = -ENOMEM;
-				goto err_out2;
-			}
-
-			state.file_info = FILE_OPENED;
-
-			rc = ksmbd_vfs_getattr(&fp->filp->f_path, &state.stat);
-			if (rc)
-				goto err_out2;
-
-			goto reconnected_fp;
-		}
-
-		if (state.dh_info.type == DURABLE_REQ_V2 && state.dh_info.app_instance_id)
-			ksmbd_close_fd_app_instance_id(state.dh_info.AppInstanceId);
-	} else if (req_op_level == SMB2_OPLOCK_LEVEL_LEASE) {
-		lc = parse_lease_state(req);
-		if (IS_ERR(lc)) {
-			rc = PTR_ERR(lc);
-			lc = NULL;
-			goto err_out2;
-		}
-		if (lc && lc->version == 2 && conn->dialect < SMB30_PROT_ID) {
-			kfree(lc);
-			lc = NULL;
-			req_op_level = SMB2_OPLOCK_LEVEL_NONE;
-		}
+	rc = smb2_open_parse_durable(work, req, &state);
+	if (rc)
+		goto err_out2;
+	if (state.dh_info.reconnected) {
+		fp = state.dh_info.fp;
+		goto reconnected_fp;
 	}
 
 	rc = smb2_validate_create_request(req, rsp);
@@ -4148,17 +4171,17 @@ int smb2_open(struct ksmbd_work *work)
 
 	share_ret = ksmbd_smb_check_shared_mode(fp->filp, fp);
 	if (!test_share_config_flag(work->tcon->share_conf, KSMBD_SHARE_FLAG_OPLOCKS) ||
-	    (req_op_level == SMB2_OPLOCK_LEVEL_LEASE &&
+	    (state.req_op_level == SMB2_OPLOCK_LEVEL_LEASE &&
 	     !(conn->vals->req_capabilities & SMB2_GLOBAL_CAP_LEASING))) {
 		if (share_ret < 0 && !S_ISDIR(file_inode(fp->filp)->i_mode)) {
 			rc = share_ret;
 			goto err_out1;
 		}
 	} else {
-		if (req_op_level == SMB2_OPLOCK_LEVEL_LEASE && lc) {
+		if (state.req_op_level == SMB2_OPLOCK_LEVEL_LEASE && state.lc) {
 			if (S_ISDIR(file_inode(filp)->i_mode)) {
-				lc->req_state &= ~SMB2_LEASE_WRITE_CACHING_LE;
-				lc->is_dir = true;
+				state.lc->req_state &= ~SMB2_LEASE_WRITE_CACHING_LE;
+				state.lc->is_dir = true;
 			}
 
 			/*
@@ -4166,24 +4189,24 @@ int smb2_open(struct ksmbd_work *work)
 			 * a lease that has same parent key, Send lease break
 			 * notification.
 			 */
-			smb_send_parent_lease_break_noti(fp, lc);
+			smb_send_parent_lease_break_noti(fp, state.lc);
 
-			req_op_level = smb2_map_lease_to_oplock(lc->req_state);
+			state.req_op_level = smb2_map_lease_to_oplock(state.lc->req_state);
 			ksmbd_debug(SMB,
 				    "lease req for(%s) req oplock state 0x%x, lease state 0x%x\n",
-				    state.name, req_op_level, lc->req_state);
-			rc = find_same_lease_key(conn, fp->f_ci, lc);
+				    state.name, state.req_op_level, state.lc->req_state);
+			rc = find_same_lease_key(conn, fp->f_ci, state.lc);
 			if (rc)
 				goto err_out1;
 		} else if (open_flags == O_RDONLY &&
-			   (req_op_level == SMB2_OPLOCK_LEVEL_BATCH ||
-			    req_op_level == SMB2_OPLOCK_LEVEL_EXCLUSIVE))
-			req_op_level = SMB2_OPLOCK_LEVEL_II;
+			   (state.req_op_level == SMB2_OPLOCK_LEVEL_BATCH ||
+			    state.req_op_level == SMB2_OPLOCK_LEVEL_EXCLUSIVE))
+			state.req_op_level = SMB2_OPLOCK_LEVEL_II;
 
-		rc = smb_grant_oplock(work, req_op_level,
+		rc = smb_grant_oplock(work, state.req_op_level,
 				      fp->persistent_id, fp,
 				      le32_to_cpu(req->hdr.Id.SyncId.TreeId),
-				      lc, share_ret);
+				      state.lc, share_ret);
 		if (rc < 0)
 			goto err_out1;
 	}
@@ -4318,7 +4341,7 @@ err_out2:
 	}
 
 	kfree(state.name);
-	kfree(lc);
+	kfree(state.lc);
 
 	return rc;
 }
