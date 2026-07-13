@@ -3798,6 +3798,87 @@ static int smb2_create_inherit_acls(struct ksmbd_work *work,
 	return 0;
 }
 
+static int smb2_open_file(struct ksmbd_work *work,
+			  struct smb2_create_req *req,
+			  struct smb2_open_state *state)
+{
+	struct file *filp;
+	int rc;
+
+	filp = dentry_open(&state->path, state->open_flags, current_cred());
+	if (IS_ERR(filp)) {
+		rc = PTR_ERR(filp);
+		pr_err("dentry open for dir failed, rc %d\n", rc);
+		return rc;
+	}
+
+	if (state->file_present) {
+		if (!(state->open_flags & O_TRUNC))
+			state->file_info = FILE_OPENED;
+		else
+			state->file_info = FILE_OVERWRITTEN;
+
+		if ((req->CreateDisposition & FILE_CREATE_MASK_LE) ==
+		    FILE_SUPERSEDE_LE)
+			state->file_info = FILE_SUPERSEDED;
+	} else if (state->open_flags & O_CREAT) {
+		state->file_info = FILE_CREATED;
+	}
+
+	ksmbd_vfs_set_fadvise(filp, req->CreateOptions);
+
+	/* Obtain Volatile-ID */
+	state->fp = ksmbd_open_fd(work, filp);
+	if (IS_ERR(state->fp)) {
+		fput(filp);
+		rc = PTR_ERR(state->fp);
+		state->fp = NULL;
+		return rc;
+	}
+
+	/* Get Persistent-ID */
+	ksmbd_open_durable_fd(state->fp);
+	if (!has_file_id(state->fp->persistent_id))
+		return -ENOMEM;
+
+	state->fp->cdoption = req->CreateDisposition;
+	state->fp->daccess = state->daccess;
+	state->fp->saccess = req->ShareAccess;
+	state->fp->coption = req->CreateOptions;
+
+	/* Set default windows and posix acls if creating new file */
+	if (state->created) {
+		rc = smb2_create_inherit_acls(work, req, state);
+		if (rc)
+			return rc;
+	}
+
+	if (state->stream_name) {
+		rc = smb2_set_stream_name_xattr(&state->path, state->fp,
+						state->stream_name,
+						state->s_type);
+		if (rc)
+			return rc;
+		state->file_info = FILE_CREATED;
+	}
+
+	state->fp->attrib_only = !(req->DesiredAccess &
+			~(FILE_READ_ATTRIBUTES_LE | FILE_WRITE_ATTRIBUTES_LE |
+			  FILE_SYNCHRONIZE_LE));
+
+	state->fp->is_posix_ctxt = state->posix_ctxt;
+
+	/*
+	 * fp should be searchable through ksmbd_inode.m_fp_list after daccess,
+	 * saccess, attrib_only, and stream are initialized.
+	 */
+	down_write(&state->fp->f_ci->m_lock);
+	list_add(&state->fp->node, &state->fp->f_ci->m_fp_list);
+	up_write(&state->fp->f_ci->m_lock);
+
+	return 0;
+}
+
 static int smb2_apply_create_contexts(struct ksmbd_work *work,
 				      struct smb2_create_req *req,
 				      struct ksmbd_file *fp,
@@ -4024,8 +4105,6 @@ int smb2_open(struct ksmbd_work *work)
 	struct smb2_create_rsp *rsp;
 	struct smb2_open_state state = {};
 	struct ksmbd_share_config *share = tcon->share_conf;
-	struct ksmbd_file *fp = NULL;
-	struct file *filp = NULL;
 	int rc = 0;
 	int share_ret, need_truncate = 0;
 
@@ -4058,7 +4137,7 @@ int smb2_open(struct ksmbd_work *work)
 	if (rc)
 		goto err_out2;
 	if (state.dh_info.reconnected) {
-		fp = state.dh_info.fp;
+		state.fp = state.dh_info.fp;
 		goto reconnected_fp;
 	}
 
@@ -4085,88 +4164,18 @@ int smb2_open(struct ksmbd_work *work)
 	if (rc)
 		goto err_out;
 
-	rc = 0;
-	filp = dentry_open(&state.path, state.open_flags, current_cred());
-	if (IS_ERR(filp)) {
-		rc = PTR_ERR(filp);
-		pr_err("dentry open for dir failed, rc %d\n", rc);
+	rc = smb2_open_file(work, req, &state);
+	if (rc)
 		goto err_out;
-	}
-
-	if (state.file_present) {
-		if (!(state.open_flags & O_TRUNC))
-			state.file_info = FILE_OPENED;
-		else
-			state.file_info = FILE_OVERWRITTEN;
-
-		if ((req->CreateDisposition & FILE_CREATE_MASK_LE) ==
-		    FILE_SUPERSEDE_LE)
-			state.file_info = FILE_SUPERSEDED;
-	} else if (state.open_flags & O_CREAT) {
-		state.file_info = FILE_CREATED;
-	}
-
-	ksmbd_vfs_set_fadvise(filp, req->CreateOptions);
-
-	/* Obtain Volatile-ID */
-	fp = ksmbd_open_fd(work, filp);
-	if (IS_ERR(fp)) {
-		fput(filp);
-		rc = PTR_ERR(fp);
-		fp = NULL;
-		goto err_out;
-	}
-
-	/* Get Persistent-ID */
-	ksmbd_open_durable_fd(fp);
-	if (!has_file_id(fp->persistent_id)) {
-		rc = -ENOMEM;
-		goto err_out;
-	}
-
-	fp->cdoption = req->CreateDisposition;
-	fp->daccess = state.daccess;
-	fp->saccess = req->ShareAccess;
-	fp->coption = req->CreateOptions;
-
-	/* Set default windows and posix acls if creating new file */
-	if (state.created) {
-		rc = smb2_create_inherit_acls(work, req, &state);
-		if (rc)
-			goto err_out;
-	}
-
-	if (state.stream_name) {
-		rc = smb2_set_stream_name_xattr(&state.path,
-						fp,
-						state.stream_name,
-						state.s_type);
-		if (rc)
-			goto err_out;
-		state.file_info = FILE_CREATED;
-	}
-
-	fp->attrib_only = !(req->DesiredAccess & ~(FILE_READ_ATTRIBUTES_LE |
-			FILE_WRITE_ATTRIBUTES_LE | FILE_SYNCHRONIZE_LE));
-
-	fp->is_posix_ctxt = state.posix_ctxt;
-
-	/* fp should be searchable through ksmbd_inode.m_fp_list
-	 * after daccess, saccess, attrib_only, and stream are
-	 * initialized.
-	 */
-	down_write(&fp->f_ci->m_lock);
-	list_add(&fp->node, &fp->f_ci->m_fp_list);
-	up_write(&fp->f_ci->m_lock);
 
 	/* Check delete pending among previous fp before oplock break */
-	if (ksmbd_inode_pending_delete(fp)) {
+	if (ksmbd_inode_pending_delete(state.fp)) {
 		rc = -EBUSY;
 		goto err_out;
 	}
 
 	if (!state.stream_name && state.daccess & FILE_DELETE_LE &&
-	    ksmbd_has_stream_without_delete_share(fp)) {
+	    ksmbd_has_stream_without_delete_share(state.fp)) {
 		rc = -EPERM;
 		goto err_out;
 	}
@@ -4174,23 +4183,24 @@ int smb2_open(struct ksmbd_work *work)
 	if (state.file_present || state.created)
 		path_put(&state.path);
 
-	if (!S_ISDIR(file_inode(filp)->i_mode) && state.open_flags & O_TRUNC &&
-	    !fp->attrib_only && !state.stream_name) {
-		smb_break_all_oplock(work, fp);
+	if (!S_ISDIR(file_inode(state.fp->filp)->i_mode) &&
+	    state.open_flags & O_TRUNC &&
+	    !state.fp->attrib_only && !state.stream_name) {
+		smb_break_all_oplock(work, state.fp);
 		need_truncate = 1;
 	}
 
-	share_ret = ksmbd_smb_check_shared_mode(fp->filp, fp);
+	share_ret = ksmbd_smb_check_shared_mode(state.fp->filp, state.fp);
 	if (!test_share_config_flag(work->tcon->share_conf, KSMBD_SHARE_FLAG_OPLOCKS) ||
 	    (state.req_op_level == SMB2_OPLOCK_LEVEL_LEASE &&
 	     !(conn->vals->req_capabilities & SMB2_GLOBAL_CAP_LEASING))) {
-		if (share_ret < 0 && !S_ISDIR(file_inode(fp->filp)->i_mode)) {
+		if (share_ret < 0 && !S_ISDIR(file_inode(state.fp->filp)->i_mode)) {
 			rc = share_ret;
 			goto err_out1;
 		}
 	} else {
 		if (state.req_op_level == SMB2_OPLOCK_LEVEL_LEASE && state.lc) {
-			if (S_ISDIR(file_inode(filp)->i_mode)) {
+			if (S_ISDIR(file_inode(state.fp->filp)->i_mode)) {
 				state.lc->req_state &= ~SMB2_LEASE_WRITE_CACHING_LE;
 				state.lc->is_dir = true;
 			}
@@ -4200,13 +4210,13 @@ int smb2_open(struct ksmbd_work *work)
 			 * a lease that has same parent key, Send lease break
 			 * notification.
 			 */
-			smb_send_parent_lease_break_noti(fp, state.lc);
+			smb_send_parent_lease_break_noti(state.fp, state.lc);
 
 			state.req_op_level = smb2_map_lease_to_oplock(state.lc->req_state);
 			ksmbd_debug(SMB,
 				    "lease req for(%s) req oplock state 0x%x, lease state 0x%x\n",
 				    state.name, state.req_op_level, state.lc->req_state);
-			rc = find_same_lease_key(conn, fp->f_ci, state.lc);
+			rc = find_same_lease_key(conn, state.fp->f_ci, state.lc);
 			if (rc)
 				goto err_out1;
 		} else if (state.open_flags == O_RDONLY &&
@@ -4215,7 +4225,7 @@ int smb2_open(struct ksmbd_work *work)
 			state.req_op_level = SMB2_OPLOCK_LEVEL_II;
 
 		rc = smb_grant_oplock(work, state.req_op_level,
-				      fp->persistent_id, fp,
+				      state.fp->persistent_id, state.fp,
 				      le32_to_cpu(req->hdr.Id.SyncId.TreeId),
 				      state.lc, share_ret);
 		if (rc < 0)
@@ -4223,17 +4233,17 @@ int smb2_open(struct ksmbd_work *work)
 	}
 
 	if (req->CreateOptions & FILE_DELETE_ON_CLOSE_LE) {
-		smb_break_all_levII_oplock_for_delete(work, fp);
-		ksmbd_fd_set_delete_on_close(fp, state.file_info);
+		smb_break_all_levII_oplock_for_delete(work, state.fp);
+		ksmbd_fd_set_delete_on_close(state.fp, state.file_info);
 	}
 
 	if (need_truncate) {
-		rc = smb2_create_truncate(&fp->filp->f_path);
+		rc = smb2_create_truncate(&state.fp->filp->f_path);
 		if (rc)
 			goto err_out1;
 	}
 
-	rc = smb2_apply_create_contexts(work, req, fp, &state);
+	rc = smb2_apply_create_contexts(work, req, state.fp, &state);
 	if (rc)
 		goto err_out1;
 
@@ -4242,53 +4252,53 @@ int smb2_open(struct ksmbd_work *work)
 		goto err_out1;
 
 	if (state.stat.result_mask & STATX_BTIME)
-		fp->create_time = ksmbd_UnixTimeToNT(state.stat.btime);
+		state.fp->create_time = ksmbd_UnixTimeToNT(state.stat.btime);
 	else
-		fp->create_time = ksmbd_UnixTimeToNT(state.stat.ctime);
-	fp->change_time = ksmbd_UnixTimeToNT(state.stat.ctime);
-	fp->allocation_size = S_ISDIR(state.stat.mode) ? 0 :
+		state.fp->create_time = ksmbd_UnixTimeToNT(state.stat.ctime);
+	state.fp->change_time = ksmbd_UnixTimeToNT(state.stat.ctime);
+	state.fp->allocation_size = S_ISDIR(state.stat.mode) ? 0 :
 		(state.alloc_size ?: state.stat.blocks << 9);
-	if (req->FileAttributes || fp->f_ci->m_fattr == 0)
-		fp->f_ci->m_fattr =
+	if (req->FileAttributes || state.fp->f_ci->m_fattr == 0)
+		state.fp->f_ci->m_fattr =
 			cpu_to_le32(smb2_get_dos_mode(&state.stat,
 						      le32_to_cpu(req->FileAttributes)));
 
 	if (!state.created)
-		smb2_update_xattrs(tcon, &state.path, fp);
+		smb2_update_xattrs(tcon, &state.path, state.fp);
 
-	ksmbd_vfs_update_compressed_fattr(state.path.dentry, &fp->f_ci->m_fattr);
+	ksmbd_vfs_update_compressed_fattr(state.path.dentry, &state.fp->f_ci->m_fattr);
 
 	if (state.created)
-		smb2_new_xattrs(tcon, &state.path, fp);
+		smb2_new_xattrs(tcon, &state.path, state.fp);
 
-	memcpy(fp->client_guid, conn->ClientGUID, SMB2_CLIENT_GUID_SIZE);
+	memcpy(state.fp->client_guid, conn->ClientGUID, SMB2_CLIENT_GUID_SIZE);
 
 	if (state.dh_info.type == DURABLE_REQ_V2 || state.dh_info.type == DURABLE_REQ) {
 		if (state.dh_info.type == DURABLE_REQ_V2 && state.dh_info.persistent &&
 		    test_share_config_flag(work->tcon->share_conf,
 					   KSMBD_SHARE_FLAG_CONTINUOUS_AVAILABILITY))
-			fp->is_persistent = true;
+			state.fp->is_persistent = true;
 		else
-			fp->is_durable = true;
+			state.fp->is_durable = true;
 
 		if (state.dh_info.type == DURABLE_REQ_V2) {
-			memcpy(fp->create_guid, state.dh_info.CreateGuid,
+			memcpy(state.fp->create_guid, state.dh_info.CreateGuid,
 			       SMB2_CREATE_GUID_SIZE);
 			if (state.dh_info.app_instance_id)
-				memcpy(fp->app_instance_id,
+				memcpy(state.fp->app_instance_id,
 				       state.dh_info.AppInstanceId,
 				       SMB2_CREATE_GUID_SIZE);
 			if (state.dh_info.timeout)
-				fp->durable_timeout =
+				state.fp->durable_timeout =
 					min_t(unsigned int, state.dh_info.timeout,
 					      DURABLE_HANDLE_MAX_TIMEOUT);
 			else
-				fp->durable_timeout = 60;
+				state.fp->durable_timeout = 60;
 		}
 	}
 
 reconnected_fp:
-	smb2_open_set_rsp(work, rsp, fp, &state);
+	smb2_open_set_rsp(work, rsp, state.fp, &state);
 
 err_out:
 	if (rc && (state.file_present || state.created))
@@ -4299,7 +4309,7 @@ err_out1:
 
 err_out2:
 	if (!rc) {
-		rc = ksmbd_update_fstate(&work->sess->file_table, fp,
+		rc = ksmbd_update_fstate(&work->sess->file_table, state.fp,
 					 FP_INITED);
 		if (!rc)
 			rc = ksmbd_iov_pin_rsp(work, (void *)rsp,
@@ -4331,8 +4341,8 @@ err_out2:
 		if (!rsp->hdr.Status)
 			rsp->hdr.Status = STATUS_UNEXPECTED_IO_ERROR;
 
-		if (fp)
-			ksmbd_fd_put(work, fp);
+		if (state.fp)
+			ksmbd_fd_put(work, state.fp);
 		smb2_set_err_rsp(work);
 		ksmbd_debug(SMB, "Error response: %x\n", rsp->hdr.Status);
 	}
@@ -4345,7 +4355,7 @@ err_out2:
 		 * lookup reference through the same session-aware path so
 		 * final close removes the volatile id before freeing fp.
 		 */
-		if (rc && fp == state.dh_info.fp)
+		if (rc && state.fp == state.dh_info.fp)
 			ksmbd_fd_put(work, state.dh_info.fp);
 		else
 			ksmbd_put_durable_fd(state.dh_info.fp);
