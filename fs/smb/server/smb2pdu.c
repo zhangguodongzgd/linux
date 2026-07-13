@@ -3276,6 +3276,94 @@ static int smb2_open_get_name(struct ksmbd_work *work,
 	return 0;
 }
 
+static int smb2_open_parse_durable(struct ksmbd_work *work,
+				   struct smb2_create_req *req,
+				   char *name,
+				   struct lease_ctx_info **lc,
+				   struct durable_info *dh_info,
+				   int *req_op_level,
+				   struct ksmbd_file **fp,
+				   struct kstat *stat,
+				   int *file_info,
+				   bool *reconnected)
+{
+	struct ksmbd_conn *conn = work->conn;
+	struct ksmbd_share_config *share = work->tcon->share_conf;
+	struct ksmbd_session *sess = work->sess;
+	int rc;
+
+	*reconnected = false;
+	*req_op_level = req->RequestedOplockLevel;
+
+	if (server_conf.flags & KSMBD_GLOBAL_FLAG_DURABLE_HANDLE &&
+	    req->CreateContextsOffset) {
+		*lc = parse_lease_state(req);
+		if (IS_ERR(*lc)) {
+			rc = PTR_ERR(*lc);
+			*lc = NULL;
+			return rc;
+		}
+		if (*lc && (*lc)->version == 2 && conn->dialect < SMB30_PROT_ID) {
+			kfree(*lc);
+			*lc = NULL;
+			if (*req_op_level == SMB2_OPLOCK_LEVEL_LEASE)
+				*req_op_level = SMB2_OPLOCK_LEVEL_NONE;
+		}
+
+		rc = parse_durable_handle_context(work, req, *lc, dh_info);
+		if (rc) {
+			ksmbd_debug(SMB, "error parsing durable handle context\n");
+			return rc;
+		}
+
+		rc = parse_app_instance_id(req, dh_info);
+		if (rc)
+			return rc;
+
+		if (dh_info->reconnected) {
+			rc = smb2_check_durable_oplock(conn, share, dh_info->fp,
+						       *lc, sess->user, name);
+			if (rc)
+				return rc;
+
+			rc = ksmbd_reopen_durable_fd(work, dh_info->fp);
+			if (rc)
+				return rc;
+
+			*fp = dh_info->fp;
+
+			if (ksmbd_override_fsids(work))
+				return -ENOMEM;
+
+			*file_info = FILE_OPENED;
+
+			rc = ksmbd_vfs_getattr(&(*fp)->filp->f_path, stat);
+			if (rc)
+				return rc;
+
+			*reconnected = true;
+			return 0;
+		}
+
+		if (dh_info->type == DURABLE_REQ_V2 && dh_info->app_instance_id)
+			ksmbd_close_fd_app_instance_id(dh_info->AppInstanceId);
+	} else if (*req_op_level == SMB2_OPLOCK_LEVEL_LEASE) {
+		*lc = parse_lease_state(req);
+		if (IS_ERR(*lc)) {
+			rc = PTR_ERR(*lc);
+			*lc = NULL;
+			return rc;
+		}
+		if (*lc && (*lc)->version == 2 && conn->dialect < SMB30_PROT_ID) {
+			kfree(*lc);
+			*lc = NULL;
+			*req_op_level = SMB2_OPLOCK_LEVEL_NONE;
+		}
+	}
+
+	return 0;
+}
+
 static int smb2_validate_create_request(struct smb2_create_req *req,
 					struct smb2_create_rsp *rsp)
 {
@@ -3802,7 +3890,7 @@ int smb2_open(struct ksmbd_work *work)
 	int req_op_level = 0, open_flags = 0, may_flags = 0, file_info = 0;
 	int rc = 0;
 	int query_disk_id = 0;
-	bool maximal_access_ctxt = false, posix_ctxt = false;
+	bool maximal_access_ctxt = false, posix_ctxt = false, reconnected = false;
 	int s_type = 0;
 	char *name = NULL;
 	char *stream_name = NULL;
@@ -3840,72 +3928,13 @@ int smb2_open(struct ksmbd_work *work)
 	if (rc)
 		goto err_out2;
 
-	req_op_level = req->RequestedOplockLevel;
-
-	if (server_conf.flags & KSMBD_GLOBAL_FLAG_DURABLE_HANDLE &&
-	    req->CreateContextsOffset) {
-		lc = parse_lease_state(req);
-		if (IS_ERR(lc)) {
-			rc = PTR_ERR(lc);
-			lc = NULL;
-			goto err_out2;
-		}
-		if (lc && lc->version == 2 && conn->dialect < SMB30_PROT_ID) {
-			kfree(lc);
-			lc = NULL;
-			if (req_op_level == SMB2_OPLOCK_LEVEL_LEASE)
-				req_op_level = SMB2_OPLOCK_LEVEL_NONE;
-		}
-		rc = parse_durable_handle_context(work, req, lc, &dh_info);
-		if (rc) {
-			ksmbd_debug(SMB, "error parsing durable handle context\n");
-			goto err_out2;
-		}
-		rc = parse_app_instance_id(req, &dh_info);
-		if (rc)
-			goto err_out2;
-
-		if (dh_info.reconnected == true) {
-			rc = smb2_check_durable_oplock(conn, share, dh_info.fp,
-					lc, sess->user, name);
-			if (rc)
-				goto err_out2;
-
-			rc = ksmbd_reopen_durable_fd(work, dh_info.fp);
-			if (rc)
-				goto err_out2;
-
-			fp = dh_info.fp;
-
-			if (ksmbd_override_fsids(work)) {
-				rc = -ENOMEM;
-				goto err_out2;
-			}
-
-			file_info = FILE_OPENED;
-
-			rc = ksmbd_vfs_getattr(&fp->filp->f_path, &stat);
-			if (rc)
-				goto err_out2;
-
-			goto reconnected_fp;
-		}
-
-		if (dh_info.type == DURABLE_REQ_V2 && dh_info.app_instance_id)
-			ksmbd_close_fd_app_instance_id(dh_info.AppInstanceId);
-	} else if (req_op_level == SMB2_OPLOCK_LEVEL_LEASE) {
-		lc = parse_lease_state(req);
-		if (IS_ERR(lc)) {
-			rc = PTR_ERR(lc);
-			lc = NULL;
-			goto err_out2;
-		}
-		if (lc && lc->version == 2 && conn->dialect < SMB30_PROT_ID) {
-			kfree(lc);
-			lc = NULL;
-			req_op_level = SMB2_OPLOCK_LEVEL_NONE;
-		}
-	}
+	rc = smb2_open_parse_durable(work, req, name, &lc, &dh_info,
+				     &req_op_level, &fp, &stat, &file_info,
+				     &reconnected);
+	if (rc)
+		goto err_out2;
+	if (reconnected)
+		goto reconnected_fp;
 
 	rc = smb2_validate_create_request(req, rsp);
 	if (rc)
