@@ -4193,6 +4193,75 @@ static int smb2_open_setup_oplock(struct ksmbd_work *work,
 	return 0;
 }
 
+static int smb2_open_finalize_file(struct ksmbd_work *work,
+				   struct smb2_create_req *req,
+				   struct smb2_open_state *state)
+{
+	struct ksmbd_conn *conn = work->conn;
+	struct ksmbd_tree_connect *tcon = work->tcon;
+	int rc;
+
+	rc = ksmbd_vfs_getattr(&state->path, &state->stat);
+	if (rc)
+		return rc;
+
+	if (state->stat.result_mask & STATX_BTIME)
+		state->fp->create_time =
+			ksmbd_UnixTimeToNT(state->stat.btime);
+	else
+		state->fp->create_time =
+			ksmbd_UnixTimeToNT(state->stat.ctime);
+	state->fp->change_time = ksmbd_UnixTimeToNT(state->stat.ctime);
+	state->fp->allocation_size = S_ISDIR(state->stat.mode) ? 0 :
+		(state->alloc_size ?: state->stat.blocks << 9);
+	if (req->FileAttributes || state->fp->f_ci->m_fattr == 0)
+		state->fp->f_ci->m_fattr =
+			cpu_to_le32(smb2_get_dos_mode(&state->stat,
+						      le32_to_cpu(req->FileAttributes)));
+
+	if (!state->created)
+		smb2_update_xattrs(tcon, &state->path, state->fp);
+
+	ksmbd_vfs_update_compressed_fattr(state->path.dentry,
+					  &state->fp->f_ci->m_fattr);
+
+	if (state->created)
+		smb2_new_xattrs(tcon, &state->path, state->fp);
+
+	memcpy(state->fp->client_guid, conn->ClientGUID,
+	       SMB2_CLIENT_GUID_SIZE);
+
+	if (state->dh_info.type == DURABLE_REQ_V2 ||
+	    state->dh_info.type == DURABLE_REQ) {
+		if (state->dh_info.type == DURABLE_REQ_V2 &&
+		    state->dh_info.persistent &&
+		    test_share_config_flag(work->tcon->share_conf,
+					   KSMBD_SHARE_FLAG_CONTINUOUS_AVAILABILITY))
+			state->fp->is_persistent = true;
+		else
+			state->fp->is_durable = true;
+
+		if (state->dh_info.type == DURABLE_REQ_V2) {
+			memcpy(state->fp->create_guid,
+			       state->dh_info.CreateGuid,
+			       SMB2_CREATE_GUID_SIZE);
+			if (state->dh_info.app_instance_id)
+				memcpy(state->fp->app_instance_id,
+				       state->dh_info.AppInstanceId,
+				       SMB2_CREATE_GUID_SIZE);
+			if (state->dh_info.timeout)
+				state->fp->durable_timeout =
+					min_t(unsigned int,
+					      state->dh_info.timeout,
+					      DURABLE_HANDLE_MAX_TIMEOUT);
+			else
+				state->fp->durable_timeout = 60;
+		}
+	}
+
+	return 0;
+}
+
 /**
  * smb2_open() - handler for smb file open request
  * @work:	smb work containing request buffer
@@ -4201,12 +4270,10 @@ static int smb2_open_setup_oplock(struct ksmbd_work *work,
  */
 int smb2_open(struct ksmbd_work *work)
 {
-	struct ksmbd_conn *conn = work->conn;
-	struct ksmbd_tree_connect *tcon = work->tcon;
 	struct smb2_create_req *req;
 	struct smb2_create_rsp *rsp;
 	struct smb2_open_state state = {};
-	struct ksmbd_share_config *share = tcon->share_conf;
+	struct ksmbd_share_config *share = work->tcon->share_conf;
 	int rc = 0;
 
 	ksmbd_debug(SMB, "Received smb2 create request\n");
@@ -4276,55 +4343,9 @@ int smb2_open(struct ksmbd_work *work)
 	if (rc)
 		goto err_out1;
 
-	rc = ksmbd_vfs_getattr(&state.path, &state.stat);
+	rc = smb2_open_finalize_file(work, req, &state);
 	if (rc)
 		goto err_out1;
-
-	if (state.stat.result_mask & STATX_BTIME)
-		state.fp->create_time = ksmbd_UnixTimeToNT(state.stat.btime);
-	else
-		state.fp->create_time = ksmbd_UnixTimeToNT(state.stat.ctime);
-	state.fp->change_time = ksmbd_UnixTimeToNT(state.stat.ctime);
-	state.fp->allocation_size = S_ISDIR(state.stat.mode) ? 0 :
-		(state.alloc_size ?: state.stat.blocks << 9);
-	if (req->FileAttributes || state.fp->f_ci->m_fattr == 0)
-		state.fp->f_ci->m_fattr =
-			cpu_to_le32(smb2_get_dos_mode(&state.stat,
-						      le32_to_cpu(req->FileAttributes)));
-
-	if (!state.created)
-		smb2_update_xattrs(tcon, &state.path, state.fp);
-
-	ksmbd_vfs_update_compressed_fattr(state.path.dentry, &state.fp->f_ci->m_fattr);
-
-	if (state.created)
-		smb2_new_xattrs(tcon, &state.path, state.fp);
-
-	memcpy(state.fp->client_guid, conn->ClientGUID, SMB2_CLIENT_GUID_SIZE);
-
-	if (state.dh_info.type == DURABLE_REQ_V2 || state.dh_info.type == DURABLE_REQ) {
-		if (state.dh_info.type == DURABLE_REQ_V2 && state.dh_info.persistent &&
-		    test_share_config_flag(work->tcon->share_conf,
-					   KSMBD_SHARE_FLAG_CONTINUOUS_AVAILABILITY))
-			state.fp->is_persistent = true;
-		else
-			state.fp->is_durable = true;
-
-		if (state.dh_info.type == DURABLE_REQ_V2) {
-			memcpy(state.fp->create_guid, state.dh_info.CreateGuid,
-			       SMB2_CREATE_GUID_SIZE);
-			if (state.dh_info.app_instance_id)
-				memcpy(state.fp->app_instance_id,
-				       state.dh_info.AppInstanceId,
-				       SMB2_CREATE_GUID_SIZE);
-			if (state.dh_info.timeout)
-				state.fp->durable_timeout =
-					min_t(unsigned int, state.dh_info.timeout,
-					      DURABLE_HANDLE_MAX_TIMEOUT);
-			else
-				state.fp->durable_timeout = 60;
-		}
-	}
 
 reconnected_fp:
 	smb2_open_set_rsp(work, rsp, state.fp, &state);
