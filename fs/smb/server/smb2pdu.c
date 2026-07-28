@@ -4117,6 +4117,82 @@ static void smb2_open_set_rsp(struct ksmbd_work *work,
 			cpu_to_le32(offsetof(struct smb2_create_rsp, Buffer));
 }
 
+static int smb2_open_setup_oplock(struct ksmbd_work *work,
+				  struct smb2_create_req *req,
+				  struct smb2_open_state *state)
+{
+	struct ksmbd_conn *conn = work->conn;
+	int share_ret;
+	bool need_truncate = false;
+	int rc;
+
+	if (!S_ISDIR(file_inode(state->fp->filp)->i_mode) &&
+	    state->open_flags & O_TRUNC &&
+	    !state->fp->attrib_only && !state->stream_name) {
+		smb_break_all_oplock(work, state->fp);
+		need_truncate = true;
+	}
+
+	share_ret = ksmbd_smb_check_shared_mode(state->fp->filp, state->fp);
+	if (!test_share_config_flag(work->tcon->share_conf,
+				    KSMBD_SHARE_FLAG_OPLOCKS) ||
+	    (state->req_op_level == SMB2_OPLOCK_LEVEL_LEASE &&
+	     !(conn->vals->req_capabilities & SMB2_GLOBAL_CAP_LEASING))) {
+		if (share_ret < 0 &&
+		    !S_ISDIR(file_inode(state->fp->filp)->i_mode))
+			return share_ret;
+	} else {
+		if (state->req_op_level == SMB2_OPLOCK_LEVEL_LEASE &&
+		    state->lc) {
+			if (S_ISDIR(file_inode(state->fp->filp)->i_mode)) {
+				state->lc->req_state &=
+					~SMB2_LEASE_WRITE_CACHING_LE;
+				state->lc->is_dir = true;
+			}
+
+			/*
+			 * Compare parent lease using parent key. If there is no
+			 * lease with the same parent key, send a lease break
+			 * notification.
+			 */
+			smb_send_parent_lease_break_noti(state->fp, state->lc);
+
+			state->req_op_level =
+				smb2_map_lease_to_oplock(state->lc->req_state);
+			ksmbd_debug(SMB,
+				    "lease req for(%s) req oplock state 0x%x, lease state 0x%x\n",
+				    state->name, state->req_op_level,
+				    state->lc->req_state);
+			rc = find_same_lease_key(conn, state->fp->f_ci,
+						 state->lc);
+			if (rc)
+				return rc;
+		} else if (state->open_flags == O_RDONLY &&
+			   (state->req_op_level == SMB2_OPLOCK_LEVEL_BATCH ||
+			    state->req_op_level ==
+			    SMB2_OPLOCK_LEVEL_EXCLUSIVE)) {
+			state->req_op_level = SMB2_OPLOCK_LEVEL_II;
+		}
+
+		rc = smb_grant_oplock(work, state->req_op_level,
+				      state->fp->persistent_id, state->fp,
+				      le32_to_cpu(req->hdr.Id.SyncId.TreeId),
+				      state->lc, share_ret);
+		if (rc < 0)
+			return rc;
+	}
+
+	if (req->CreateOptions & FILE_DELETE_ON_CLOSE_LE) {
+		smb_break_all_levII_oplock_for_delete(work, state->fp);
+		ksmbd_fd_set_delete_on_close(state->fp, state->file_info);
+	}
+
+	if (need_truncate)
+		return smb2_create_truncate(&state->fp->filp->f_path);
+
+	return 0;
+}
+
 /**
  * smb2_open() - handler for smb file open request
  * @work:	smb work containing request buffer
@@ -4132,7 +4208,6 @@ int smb2_open(struct ksmbd_work *work)
 	struct smb2_open_state state = {};
 	struct ksmbd_share_config *share = tcon->share_conf;
 	int rc = 0;
-	int share_ret, need_truncate = 0;
 
 	ksmbd_debug(SMB, "Received smb2 create request\n");
 
@@ -4193,65 +4268,9 @@ int smb2_open(struct ksmbd_work *work)
 	if (state.file_present || state.created)
 		path_put(&state.path);
 
-	if (!S_ISDIR(file_inode(state.fp->filp)->i_mode) &&
-	    state.open_flags & O_TRUNC &&
-	    !state.fp->attrib_only && !state.stream_name) {
-		smb_break_all_oplock(work, state.fp);
-		need_truncate = 1;
-	}
-
-	share_ret = ksmbd_smb_check_shared_mode(state.fp->filp, state.fp);
-	if (!test_share_config_flag(work->tcon->share_conf, KSMBD_SHARE_FLAG_OPLOCKS) ||
-	    (state.req_op_level == SMB2_OPLOCK_LEVEL_LEASE &&
-	     !(conn->vals->req_capabilities & SMB2_GLOBAL_CAP_LEASING))) {
-		if (share_ret < 0 && !S_ISDIR(file_inode(state.fp->filp)->i_mode)) {
-			rc = share_ret;
-			goto err_out1;
-		}
-	} else {
-		if (state.req_op_level == SMB2_OPLOCK_LEVEL_LEASE && state.lc) {
-			if (S_ISDIR(file_inode(state.fp->filp)->i_mode)) {
-				state.lc->req_state &= ~SMB2_LEASE_WRITE_CACHING_LE;
-				state.lc->is_dir = true;
-			}
-
-			/*
-			 * Compare parent lease using parent key. If there is no
-			 * a lease that has same parent key, Send lease break
-			 * notification.
-			 */
-			smb_send_parent_lease_break_noti(state.fp, state.lc);
-
-			state.req_op_level = smb2_map_lease_to_oplock(state.lc->req_state);
-			ksmbd_debug(SMB,
-				    "lease req for(%s) req oplock state 0x%x, lease state 0x%x\n",
-				    state.name, state.req_op_level, state.lc->req_state);
-			rc = find_same_lease_key(conn, state.fp->f_ci, state.lc);
-			if (rc)
-				goto err_out1;
-		} else if (state.open_flags == O_RDONLY &&
-			   (state.req_op_level == SMB2_OPLOCK_LEVEL_BATCH ||
-			    state.req_op_level == SMB2_OPLOCK_LEVEL_EXCLUSIVE))
-			state.req_op_level = SMB2_OPLOCK_LEVEL_II;
-
-		rc = smb_grant_oplock(work, state.req_op_level,
-				      state.fp->persistent_id, state.fp,
-				      le32_to_cpu(req->hdr.Id.SyncId.TreeId),
-				      state.lc, share_ret);
-		if (rc < 0)
-			goto err_out1;
-	}
-
-	if (req->CreateOptions & FILE_DELETE_ON_CLOSE_LE) {
-		smb_break_all_levII_oplock_for_delete(work, state.fp);
-		ksmbd_fd_set_delete_on_close(state.fp, state.file_info);
-	}
-
-	if (need_truncate) {
-		rc = smb2_create_truncate(&state.fp->filp->f_path);
-		if (rc)
-			goto err_out1;
-	}
+	rc = smb2_open_setup_oplock(work, req, &state);
+	if (rc)
+		goto err_out1;
 
 	rc = smb2_apply_create_contexts(work, req, state.fp, &state);
 	if (rc)
