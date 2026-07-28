@@ -4262,6 +4262,70 @@ static int smb2_open_finalize_file(struct ksmbd_work *work,
 	return 0;
 }
 
+static int smb2_open_complete(struct ksmbd_work *work,
+			      struct smb2_create_rsp *rsp,
+			      struct smb2_open_state *state,
+			      int rc)
+{
+	if (!rc) {
+		rc = ksmbd_update_fstate(&work->sess->file_table, state->fp,
+					 FP_INITED);
+		if (!rc)
+			rc = ksmbd_iov_pin_rsp(work, (void *)rsp,
+					       state->iov_len);
+	}
+	if (rc) {
+		if (rc == -EINVAL)
+			rsp->hdr.Status = STATUS_INVALID_PARAMETER;
+		else if (rc == -EOPNOTSUPP)
+			rsp->hdr.Status = STATUS_NOT_SUPPORTED;
+		else if (rc == -EACCES || rc == -ESTALE || rc == -EXDEV)
+			rsp->hdr.Status = STATUS_ACCESS_DENIED;
+		else if (rc == -ENOENT)
+			rsp->hdr.Status = STATUS_OBJECT_NAME_INVALID;
+		else if (rc == -EPERM)
+			rsp->hdr.Status = STATUS_SHARING_VIOLATION;
+		else if (rc == -EBUSY)
+			rsp->hdr.Status = STATUS_DELETE_PENDING;
+		else if (rc == -EBADF)
+			rsp->hdr.Status = STATUS_OBJECT_NAME_NOT_FOUND;
+		else if (rc == -ENOEXEC)
+			rsp->hdr.Status = STATUS_DUPLICATE_OBJECTID;
+		else if (rc == -ENXIO)
+			rsp->hdr.Status = STATUS_NO_SUCH_DEVICE;
+		else if (rc == -EEXIST)
+			rsp->hdr.Status = STATUS_OBJECT_NAME_COLLISION;
+		else if (rc == -EMFILE)
+			rsp->hdr.Status = STATUS_INSUFFICIENT_RESOURCES;
+		if (!rsp->hdr.Status)
+			rsp->hdr.Status = STATUS_UNEXPECTED_IO_ERROR;
+
+		if (state->fp)
+			ksmbd_fd_put(work, state->fp);
+		smb2_set_err_rsp(work);
+		ksmbd_debug(SMB, "Error response: %x\n", rsp->hdr.Status);
+	}
+
+	if (state->dh_info.reconnected) {
+		/*
+		 * If reconnect succeeded, fp was republished in the session file
+		 * table. On a later error, ksmbd_fd_put() above drops the session
+		 * reference; drop the durable lookup reference through the same
+		 * session-aware path so final close removes the volatile id
+		 * before freeing fp.
+		 */
+		if (rc && state->fp == state->dh_info.fp)
+			ksmbd_fd_put(work, state->dh_info.fp);
+		else
+			ksmbd_put_durable_fd(state->dh_info.fp);
+	}
+
+	kfree(state->name);
+	kfree(state->lc);
+
+	return rc;
+}
+
 /**
  * smb2_open() - handler for smb file open request
  * @work:	smb work containing request buffer
@@ -4358,63 +4422,7 @@ err_out1:
 	ksmbd_revert_fsids(work);
 
 err_out2:
-	if (!rc) {
-		rc = ksmbd_update_fstate(&work->sess->file_table, state.fp,
-					 FP_INITED);
-		if (!rc)
-			rc = ksmbd_iov_pin_rsp(work, (void *)rsp,
-					       state.iov_len);
-	}
-	if (rc) {
-		if (rc == -EINVAL)
-			rsp->hdr.Status = STATUS_INVALID_PARAMETER;
-		else if (rc == -EOPNOTSUPP)
-			rsp->hdr.Status = STATUS_NOT_SUPPORTED;
-		else if (rc == -EACCES || rc == -ESTALE || rc == -EXDEV)
-			rsp->hdr.Status = STATUS_ACCESS_DENIED;
-		else if (rc == -ENOENT)
-			rsp->hdr.Status = STATUS_OBJECT_NAME_INVALID;
-		else if (rc == -EPERM)
-			rsp->hdr.Status = STATUS_SHARING_VIOLATION;
-		else if (rc == -EBUSY)
-			rsp->hdr.Status = STATUS_DELETE_PENDING;
-		else if (rc == -EBADF)
-			rsp->hdr.Status = STATUS_OBJECT_NAME_NOT_FOUND;
-		else if (rc == -ENOEXEC)
-			rsp->hdr.Status = STATUS_DUPLICATE_OBJECTID;
-		else if (rc == -ENXIO)
-			rsp->hdr.Status = STATUS_NO_SUCH_DEVICE;
-		else if (rc == -EEXIST)
-			rsp->hdr.Status = STATUS_OBJECT_NAME_COLLISION;
-		else if (rc == -EMFILE)
-			rsp->hdr.Status = STATUS_INSUFFICIENT_RESOURCES;
-		if (!rsp->hdr.Status)
-			rsp->hdr.Status = STATUS_UNEXPECTED_IO_ERROR;
-
-		if (state.fp)
-			ksmbd_fd_put(work, state.fp);
-		smb2_set_err_rsp(work);
-		ksmbd_debug(SMB, "Error response: %x\n", rsp->hdr.Status);
-	}
-
-	if (state.dh_info.reconnected) {
-		/*
-		 * If reconnect succeeded, fp was republished in the
-		 * session file table.  On a later error, ksmbd_fd_put()
-		 * above drops the session reference; drop the durable
-		 * lookup reference through the same session-aware path so
-		 * final close removes the volatile id before freeing fp.
-		 */
-		if (rc && state.fp == state.dh_info.fp)
-			ksmbd_fd_put(work, state.dh_info.fp);
-		else
-			ksmbd_put_durable_fd(state.dh_info.fp);
-	}
-
-	kfree(state.name);
-	kfree(state.lc);
-
-	return rc;
+	return smb2_open_complete(work, rsp, &state, rc);
 }
 
 static int readdir_info_level_struct_sz(int info_level)
