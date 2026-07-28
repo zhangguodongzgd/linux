@@ -3489,6 +3489,32 @@ static int smb2_parse_create_contexts(struct smb2_create_req *req,
 	return 0;
 }
 
+static int smb2_open_parse_request(struct ksmbd_work *work,
+				   struct smb2_create_req *req,
+				   struct smb2_create_rsp *rsp,
+				   struct smb2_open_state *state)
+{
+	int rc;
+
+	rc = smb2_parse_posix_create_context(work, req, state);
+	if (rc)
+		return rc;
+
+	rc = smb2_open_get_name(work, req, state);
+	if (rc)
+		return rc;
+
+	rc = smb2_open_parse_durable(work, req, state);
+	if (rc || state->dh_info.reconnected)
+		return rc;
+
+	rc = smb2_validate_create_request(req, rsp);
+	if (rc)
+		return rc;
+
+	return smb2_parse_create_contexts(req, rsp, state);
+}
+
 static int smb2_lookup_open_path(struct ksmbd_work *work,
 				 struct smb2_create_req *req,
 				 struct smb2_open_state *state)
@@ -4125,29 +4151,13 @@ int smb2_open(struct ksmbd_work *work)
 		return create_smb2_pipe(work);
 	}
 
-	rc = smb2_parse_posix_create_context(work, req, &state);
-	if (rc)
-		goto err_out2;
-
-	rc = smb2_open_get_name(work, req, &state);
-	if (rc)
-		goto err_out2;
-
-	rc = smb2_open_parse_durable(work, req, &state);
+	rc = smb2_open_parse_request(work, req, rsp, &state);
 	if (rc)
 		goto err_out2;
 	if (state.dh_info.reconnected) {
 		state.fp = state.dh_info.fp;
 		goto reconnected_fp;
 	}
-
-	rc = smb2_validate_create_request(req, rsp);
-	if (rc)
-		goto err_out2;
-
-	rc = smb2_parse_create_contexts(req, rsp, &state);
-	if (rc)
-		goto err_out2;
 
 	if (ksmbd_override_fsids(work)) {
 		rc = -ENOMEM;
