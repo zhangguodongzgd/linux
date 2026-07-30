@@ -3193,6 +3193,32 @@ static int parse_app_instance_id(struct smb2_create_req *req,
 	return 0;
 }
 
+struct smb2_open_state {
+	struct path path;
+	struct ksmbd_file *fp;
+	struct mnt_idmap *idmap;
+	struct kstat stat;
+	struct lease_ctx_info *lc;
+	struct create_ea_buf_req *ea_buf;
+	struct durable_info dh_info;
+	char *name;
+	char *stream_name;
+	u64 alloc_size;
+	umode_t posix_mode;
+	__le32 daccess;
+	__le32 maximal_access;
+	int req_op_level;
+	int open_flags;
+	int file_info;
+	int query_disk_id;
+	int s_type;
+	int iov_len;
+	bool maximal_access_ctxt;
+	bool posix_ctxt;
+	bool file_present;
+	bool created;
+};
+
 /**
  * smb2_open() - handler for smb file open request
  * @work:	smb work containing request buffer
