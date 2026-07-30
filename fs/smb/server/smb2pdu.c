@@ -3232,32 +3232,19 @@ int smb2_open(struct ksmbd_work *work)
 	struct ksmbd_tree_connect *tcon = work->tcon;
 	struct smb2_create_req *req;
 	struct smb2_create_rsp *rsp;
-	struct path path;
+	struct smb2_open_state state = {};
 	struct ksmbd_share_config *share = tcon->share_conf;
-	struct ksmbd_file *fp = NULL;
 	struct file *filp = NULL;
-	struct mnt_idmap *idmap = NULL;
-	struct kstat stat;
 	struct create_context *context;
-	struct lease_ctx_info *lc = NULL;
-	struct create_ea_buf_req *ea_buf = NULL;
 	struct oplock_info *opinfo;
-	struct durable_info dh_info = {0};
 	__le32 *next_ptr = NULL;
-	int req_op_level = 0, open_flags = 0, may_flags = 0, file_info = 0;
+	int may_flags = 0;
 	int rc = 0;
-	int contxt_cnt = 0, query_disk_id = 0;
-	bool maximal_access_ctxt = false, posix_ctxt = false;
-	int s_type = 0;
+	int contxt_cnt = 0;
 	int next_off = 0;
-	char *name = NULL;
-	char *stream_name = NULL;
-	bool file_present = false, created = false, already_permitted = false;
+	bool already_permitted = false;
 	int share_ret, need_truncate = 0;
-	u64 time, alloc_size = 0;
-	umode_t posix_mode = 0;
-	__le32 daccess, maximal_access = 0;
-	int iov_len = 0;
+	u64 time;
 
 	ksmbd_debug(SMB, "Received smb2 create request\n");
 
@@ -3292,118 +3279,120 @@ int smb2_open(struct ksmbd_work *work)
 			}
 			ksmbd_debug(SMB, "get posix context\n");
 
-			posix_mode = le32_to_cpu(posix->Mode);
-			posix_ctxt = true;
+			state.posix_mode = le32_to_cpu(posix->Mode);
+			state.posix_ctxt = true;
 		}
 	}
 
 	if (req->NameLength) {
-		name = smb2_get_name((char *)req + le16_to_cpu(req->NameOffset),
+		state.name = smb2_get_name((char *)req + le16_to_cpu(req->NameOffset),
 				     le16_to_cpu(req->NameLength),
 				     work->conn->local_nls);
-		if (IS_ERR(name)) {
-			rc = PTR_ERR(name);
-			name = NULL;
+		if (IS_ERR(state.name)) {
+			rc = PTR_ERR(state.name);
+			state.name = NULL;
 			goto err_out2;
 		}
 
-		ksmbd_debug(SMB, "converted name = %s\n", name);
+		ksmbd_debug(SMB, "converted name = %s\n", state.name);
 
-		if (posix_ctxt == false) {
-			if (strchr(name, ':')) {
+		if (state.posix_ctxt == false) {
+			if (strchr(state.name, ':')) {
 				if (!test_share_config_flag(work->tcon->share_conf,
 							KSMBD_SHARE_FLAG_STREAMS)) {
 					rc = -EBADF;
 					goto err_out2;
 				}
-				rc = parse_stream_name(name, &stream_name, &s_type);
+				rc = parse_stream_name(state.name,
+						       &state.stream_name,
+						       &state.s_type);
 				if (rc < 0)
 					goto err_out2;
 			}
 
-			rc = ksmbd_validate_filename(name);
+			rc = ksmbd_validate_filename(state.name);
 			if (rc < 0)
 				goto err_out2;
 		}
 
-		if (ksmbd_share_veto_filename(share, name)) {
+		if (ksmbd_share_veto_filename(share, state.name)) {
 			rc = -ENOENT;
 			ksmbd_debug(SMB, "Reject open(), vetoed file: %s\n",
-				    name);
+				    state.name);
 			goto err_out2;
 		}
 	} else {
-		name = kstrdup("", KSMBD_DEFAULT_GFP);
-		if (!name) {
+		state.name = kstrdup("", KSMBD_DEFAULT_GFP);
+		if (!state.name) {
 			rc = -ENOMEM;
 			goto err_out2;
 		}
 	}
 
-	req_op_level = req->RequestedOplockLevel;
+	state.req_op_level = req->RequestedOplockLevel;
 
 	if (server_conf.flags & KSMBD_GLOBAL_FLAG_DURABLE_HANDLE &&
 	    req->CreateContextsOffset) {
-		lc = parse_lease_state(req);
-		if (IS_ERR(lc)) {
-			rc = PTR_ERR(lc);
-			lc = NULL;
+		state.lc = parse_lease_state(req);
+		if (IS_ERR(state.lc)) {
+			rc = PTR_ERR(state.lc);
+			state.lc = NULL;
 			goto err_out2;
 		}
-		if (lc && lc->version == 2 && conn->dialect < SMB30_PROT_ID) {
-			kfree(lc);
-			lc = NULL;
-			if (req_op_level == SMB2_OPLOCK_LEVEL_LEASE)
-				req_op_level = SMB2_OPLOCK_LEVEL_NONE;
+		if (state.lc && state.lc->version == 2 && conn->dialect < SMB30_PROT_ID) {
+			kfree(state.lc);
+			state.lc = NULL;
+			if (state.req_op_level == SMB2_OPLOCK_LEVEL_LEASE)
+				state.req_op_level = SMB2_OPLOCK_LEVEL_NONE;
 		}
-		rc = parse_durable_handle_context(work, req, lc, &dh_info);
+		rc = parse_durable_handle_context(work, req, state.lc, &state.dh_info);
 		if (rc) {
 			ksmbd_debug(SMB, "error parsing durable handle context\n");
 			goto err_out2;
 		}
-		rc = parse_app_instance_id(req, &dh_info);
+		rc = parse_app_instance_id(req, &state.dh_info);
 		if (rc)
 			goto err_out2;
 
-		if (dh_info.reconnected == true) {
-			rc = smb2_check_durable_oplock(conn, share, dh_info.fp,
-					lc, sess->user, name);
+		if (state.dh_info.reconnected == true) {
+			rc = smb2_check_durable_oplock(conn, share, state.dh_info.fp,
+					state.lc, sess->user, state.name);
 			if (rc)
 				goto err_out2;
 
-			rc = ksmbd_reopen_durable_fd(work, dh_info.fp);
+			rc = ksmbd_reopen_durable_fd(work, state.dh_info.fp);
 			if (rc)
 				goto err_out2;
 
-			fp = dh_info.fp;
+			state.fp = state.dh_info.fp;
 
 			if (ksmbd_override_fsids(work)) {
 				rc = -ENOMEM;
 				goto err_out2;
 			}
 
-			file_info = FILE_OPENED;
+			state.file_info = FILE_OPENED;
 
-			rc = ksmbd_vfs_getattr(&fp->filp->f_path, &stat);
+			rc = ksmbd_vfs_getattr(&state.fp->filp->f_path, &state.stat);
 			if (rc)
 				goto err_out2;
 
 			goto reconnected_fp;
 		}
 
-		if (dh_info.type == DURABLE_REQ_V2 && dh_info.app_instance_id)
-			ksmbd_close_fd_app_instance_id(dh_info.AppInstanceId);
-	} else if (req_op_level == SMB2_OPLOCK_LEVEL_LEASE) {
-		lc = parse_lease_state(req);
-		if (IS_ERR(lc)) {
-			rc = PTR_ERR(lc);
-			lc = NULL;
+		if (state.dh_info.type == DURABLE_REQ_V2 && state.dh_info.app_instance_id)
+			ksmbd_close_fd_app_instance_id(state.dh_info.AppInstanceId);
+	} else if (state.req_op_level == SMB2_OPLOCK_LEVEL_LEASE) {
+		state.lc = parse_lease_state(req);
+		if (IS_ERR(state.lc)) {
+			rc = PTR_ERR(state.lc);
+			state.lc = NULL;
 			goto err_out2;
 		}
-		if (lc && lc->version == 2 && conn->dialect < SMB30_PROT_ID) {
-			kfree(lc);
-			lc = NULL;
-			req_op_level = SMB2_OPLOCK_LEVEL_NONE;
+		if (state.lc && state.lc->version == 2 && conn->dialect < SMB30_PROT_ID) {
+			kfree(state.lc);
+			state.lc = NULL;
+			state.req_op_level = SMB2_OPLOCK_LEVEL_NONE;
 		}
 	}
 
@@ -3479,7 +3468,7 @@ int smb2_open(struct ksmbd_work *work)
 			rc = PTR_ERR(context);
 			goto err_out2;
 		} else if (context) {
-			ea_buf = (struct create_ea_buf_req *)context;
+			state.ea_buf = (struct create_ea_buf_req *)context;
 			if (le16_to_cpu(context->DataOffset) +
 			    le32_to_cpu(context->DataLength) <
 			    sizeof(struct create_ea_buf_req)) {
@@ -3501,7 +3490,7 @@ int smb2_open(struct ksmbd_work *work)
 		} else if (context) {
 			ksmbd_debug(SMB,
 				    "get query maximal access context\n");
-			maximal_access_ctxt = 1;
+			state.maximal_access_ctxt = 1;
 		}
 
 		context = smb2_find_context_vals(req,
@@ -3521,8 +3510,8 @@ int smb2_open(struct ksmbd_work *work)
 		goto err_out2;
 	}
 
-	rc = ksmbd_vfs_kern_path(work, name, LOOKUP_NO_SYMLINKS,
-				 &path, 1);
+	rc = ksmbd_vfs_kern_path(work, state.name, LOOKUP_NO_SYMLINKS,
+				 &state.path, 1);
 
 	/*
 	 * A durable handle opened with delete-on-close is preserved across a
@@ -3534,14 +3523,14 @@ int smb2_open(struct ksmbd_work *work)
 	if (!rc && (req->CreateOptions & FILE_DELETE_ON_CLOSE_LE) &&
 	    (req->CreateDisposition == FILE_OVERWRITE_IF_LE ||
 	     req->CreateDisposition == FILE_OPEN_IF_LE) &&
-	    ksmbd_close_disconnected_durable_delete_on_close(path.dentry)) {
-		path_put(&path);
-		rc = ksmbd_vfs_kern_path(work, name, LOOKUP_NO_SYMLINKS,
-					 &path, 1);
+	    ksmbd_close_disconnected_durable_delete_on_close(state.path.dentry)) {
+		path_put(&state.path);
+		rc = ksmbd_vfs_kern_path(work, state.name, LOOKUP_NO_SYMLINKS,
+					 &state.path, 1);
 	}
 
 	if (!rc) {
-		file_present = true;
+		state.file_present = true;
 
 		if (req->CreateOptions & FILE_DELETE_ON_CLOSE_LE) {
 			/*
@@ -3560,17 +3549,17 @@ int smb2_open(struct ksmbd_work *work)
 				rc = -EACCES;
 				goto err_out;
 			}
-		} else if (d_is_symlink(path.dentry)) {
+		} else if (d_is_symlink(state.path.dentry)) {
 			rc = -EACCES;
 			goto err_out;
 		}
 
-		idmap = mnt_idmap(path.mnt);
+		state.idmap = mnt_idmap(state.path.mnt);
 	} else {
 		if (rc != -ENOENT)
 			goto err_out;
 		ksmbd_debug(SMB, "can not get linux path for %s, rc = %d\n",
-			    name, rc);
+			    state.name, rc);
 		rc = 0;
 	}
 
@@ -3581,15 +3570,15 @@ int smb2_open(struct ksmbd_work *work)
 	 * <dir>::$DATA with FILE_DIRECTORY_FILE must fail with
 	 * STATUS_NOT_A_DIRECTORY.
 	 */
-	if (stream_name || s_type == DATA_STREAM) {
+	if (state.stream_name || state.s_type == DATA_STREAM) {
 		if (req->CreateOptions & FILE_DIRECTORY_FILE_LE) {
-			if (s_type == DATA_STREAM) {
+			if (state.s_type == DATA_STREAM) {
 				rc = -EIO;
 				rsp->hdr.Status = STATUS_NOT_A_DIRECTORY;
 			}
 		} else {
-			if (file_present && S_ISDIR(d_inode(path.dentry)->i_mode) &&
-			    s_type == DATA_STREAM) {
+			if (state.file_present && S_ISDIR(d_inode(state.path.dentry)->i_mode) &&
+			    state.s_type == DATA_STREAM) {
 				rc = -EIO;
 				rsp->hdr.Status = STATUS_FILE_IS_A_DIRECTORY;
 			}
@@ -3605,59 +3594,61 @@ int smb2_open(struct ksmbd_work *work)
 			goto err_out;
 	}
 
-	if (file_present && req->CreateOptions & FILE_NON_DIRECTORY_FILE_LE &&
-	    S_ISDIR(d_inode(path.dentry)->i_mode) &&
+	if (state.file_present && req->CreateOptions & FILE_NON_DIRECTORY_FILE_LE &&
+	    S_ISDIR(d_inode(state.path.dentry)->i_mode) &&
 	    !(req->CreateOptions & FILE_DELETE_ON_CLOSE_LE)) {
 		ksmbd_debug(SMB, "open() argument is a directory: %s, %x\n",
-			    name, req->CreateOptions);
+			    state.name, req->CreateOptions);
 		rsp->hdr.Status = STATUS_FILE_IS_A_DIRECTORY;
 		rc = -EIO;
 		goto err_out;
 	}
 
-	if (file_present && (req->CreateOptions & FILE_DIRECTORY_FILE_LE) &&
+	if (state.file_present && (req->CreateOptions & FILE_DIRECTORY_FILE_LE) &&
 	    !(req->CreateDisposition == FILE_CREATE_LE) &&
-	    !S_ISDIR(d_inode(path.dentry)->i_mode)) {
+	    !S_ISDIR(d_inode(state.path.dentry)->i_mode)) {
 		rsp->hdr.Status = STATUS_NOT_A_DIRECTORY;
 		rc = -EIO;
 		goto err_out;
 	}
 
-	if (!stream_name && file_present &&
+	if (!state.stream_name && state.file_present &&
 	    req->CreateDisposition == FILE_CREATE_LE) {
 		rc = -EEXIST;
 		goto err_out;
 	}
 
-	daccess = smb_map_generic_desired_access(req->DesiredAccess);
+	state.daccess = smb_map_generic_desired_access(req->DesiredAccess);
 
-	if (file_present && !(req->CreateOptions & FILE_DELETE_ON_CLOSE_LE)) {
-		rc = smb_check_perm_dacl(conn, &path, &daccess,
+	if (state.file_present && !(req->CreateOptions & FILE_DELETE_ON_CLOSE_LE)) {
+		rc = smb_check_perm_dacl(conn, &state.path, &state.daccess,
 					 sess->user->uid);
 		if (rc)
 			goto err_out;
 	}
 
-	if (daccess & FILE_MAXIMAL_ACCESS_LE) {
-		if (!file_present) {
-			daccess = cpu_to_le32(GENERIC_ALL_FLAGS);
+	if (state.daccess & FILE_MAXIMAL_ACCESS_LE) {
+		if (!state.file_present) {
+			state.daccess = cpu_to_le32(GENERIC_ALL_FLAGS);
 		} else {
-			ksmbd_vfs_query_maximal_access(idmap,
-							    path.dentry,
-							    &daccess);
+			ksmbd_vfs_query_maximal_access(state.idmap,
+							    state.path.dentry,
+							    &state.daccess);
 			already_permitted = true;
 		}
-		maximal_access = daccess;
+		state.maximal_access = state.daccess;
 	}
 
-	open_flags = smb2_create_open_flags(file_present, daccess,
-					    req->CreateDisposition,
-					    &may_flags,
-					    req->CreateOptions,
-					    file_present ? d_inode(path.dentry)->i_mode : 0);
+	state.open_flags =
+		smb2_create_open_flags(state.file_present, state.daccess,
+				       req->CreateDisposition,
+				       &may_flags,
+				       req->CreateOptions,
+				       state.file_present ?
+				       d_inode(state.path.dentry)->i_mode : 0);
 
 	if (!test_tree_conn_flag(tcon, KSMBD_TREE_CONN_FLAG_WRITABLE)) {
-		if (open_flags & (O_CREAT | O_TRUNC)) {
+		if (state.open_flags & (O_CREAT | O_TRUNC)) {
 			ksmbd_debug(SMB,
 				    "User does not have write permission\n");
 			rc = -EACCES;
@@ -3666,9 +3657,9 @@ int smb2_open(struct ksmbd_work *work)
 	}
 
 	/*create file if not present */
-	if (!file_present) {
-		rc = smb2_creat(work, &path, name, open_flags,
-				posix_mode,
+	if (!state.file_present) {
+		rc = smb2_creat(work, &state.path, state.name, state.open_flags,
+				state.posix_mode,
 				req->CreateOptions & FILE_DIRECTORY_FILE_LE);
 		if (rc) {
 			if (rc == -ENOENT) {
@@ -3678,18 +3669,18 @@ int smb2_open(struct ksmbd_work *work)
 			goto err_out;
 		}
 
-		created = true;
-		idmap = mnt_idmap(path.mnt);
-		if (ea_buf) {
-			if (le32_to_cpu(ea_buf->ccontext.DataLength) <
+		state.created = true;
+		state.idmap = mnt_idmap(state.path.mnt);
+		if (state.ea_buf) {
+			if (le32_to_cpu(state.ea_buf->ccontext.DataLength) <
 			    sizeof(struct smb2_ea_info)) {
 				rc = -EINVAL;
 				goto err_out;
 			}
 
-			rc = smb2_set_ea(&ea_buf->ea,
-					 le32_to_cpu(ea_buf->ccontext.DataLength),
-					 &path, false);
+			rc = smb2_set_ea(&state.ea_buf->ea,
+					 le32_to_cpu(state.ea_buf->ccontext.DataLength),
+					 &state.path, false);
 			if (rc == -EOPNOTSUPP)
 				rc = 0;
 			else if (rc)
@@ -3700,17 +3691,17 @@ int smb2_open(struct ksmbd_work *work)
 		 * because execute(search) permission on a parent directory,
 		 * is already granted.
 		 */
-		if (daccess & ~(FILE_READ_ATTRIBUTES_LE | FILE_READ_CONTROL_LE)) {
-			rc = inode_permission(idmap,
-					      d_inode(path.dentry),
+		if (state.daccess & ~(FILE_READ_ATTRIBUTES_LE | FILE_READ_CONTROL_LE)) {
+			rc = inode_permission(state.idmap,
+					      d_inode(state.path.dentry),
 					      may_flags);
 			if (rc)
 				goto err_out;
 
-			if ((daccess & FILE_DELETE_LE) ||
+			if ((state.daccess & FILE_DELETE_LE) ||
 			    (req->CreateOptions & FILE_DELETE_ON_CLOSE_LE)) {
-				rc = inode_permission(idmap,
-						      d_inode(path.dentry->d_parent),
+				rc = inode_permission(state.idmap,
+						      d_inode(state.path.dentry->d_parent),
 						      MAY_EXEC | MAY_WRITE);
 				if (rc)
 					goto err_out;
@@ -3718,81 +3709,81 @@ int smb2_open(struct ksmbd_work *work)
 		}
 	}
 
-	rc = ksmbd_query_inode_status(path.dentry->d_parent);
+	rc = ksmbd_query_inode_status(state.path.dentry->d_parent);
 	if (rc == KSMBD_INODE_STATUS_PENDING_DELETE) {
 		rc = -EBUSY;
 		goto err_out;
 	}
 
 	rc = 0;
-	filp = dentry_open(&path, open_flags, current_cred());
+	filp = dentry_open(&state.path, state.open_flags, current_cred());
 	if (IS_ERR(filp)) {
 		rc = PTR_ERR(filp);
 		pr_err("dentry open for dir failed, rc %d\n", rc);
 		goto err_out;
 	}
 
-	if (file_present) {
-		if (!(open_flags & O_TRUNC))
-			file_info = FILE_OPENED;
+	if (state.file_present) {
+		if (!(state.open_flags & O_TRUNC))
+			state.file_info = FILE_OPENED;
 		else
-			file_info = FILE_OVERWRITTEN;
+			state.file_info = FILE_OVERWRITTEN;
 
 		if ((req->CreateDisposition & FILE_CREATE_MASK_LE) ==
 		    FILE_SUPERSEDE_LE)
-			file_info = FILE_SUPERSEDED;
-	} else if (open_flags & O_CREAT) {
-		file_info = FILE_CREATED;
+			state.file_info = FILE_SUPERSEDED;
+	} else if (state.open_flags & O_CREAT) {
+		state.file_info = FILE_CREATED;
 	}
 
 	ksmbd_vfs_set_fadvise(filp, req->CreateOptions);
 
 	/* Obtain Volatile-ID */
-	fp = ksmbd_open_fd(work, filp);
-	if (IS_ERR(fp)) {
+	state.fp = ksmbd_open_fd(work, filp);
+	if (IS_ERR(state.fp)) {
 		fput(filp);
-		rc = PTR_ERR(fp);
-		fp = NULL;
+		rc = PTR_ERR(state.fp);
+		state.fp = NULL;
 		goto err_out;
 	}
 
 	/* Get Persistent-ID */
-	ksmbd_open_durable_fd(fp);
-	if (!has_file_id(fp->persistent_id)) {
+	ksmbd_open_durable_fd(state.fp);
+	if (!has_file_id(state.fp->persistent_id)) {
 		rc = -ENOMEM;
 		goto err_out;
 	}
 
-	fp->cdoption = req->CreateDisposition;
-	fp->daccess = daccess;
-	fp->saccess = req->ShareAccess;
-	fp->coption = req->CreateOptions;
+	state.fp->cdoption = req->CreateDisposition;
+	state.fp->daccess = state.daccess;
+	state.fp->saccess = req->ShareAccess;
+	state.fp->coption = req->CreateOptions;
 
 	/* Set default windows and posix acls if creating new file */
-	if (created) {
+	if (state.created) {
 		int posix_acl_rc;
-		struct inode *inode = d_inode(path.dentry);
+		struct inode *inode = d_inode(state.path.dentry);
 
-		posix_acl_rc = ksmbd_vfs_inherit_posix_acl(idmap,
-							   &path,
-							   d_inode(path.dentry->d_parent));
+		posix_acl_rc = ksmbd_vfs_inherit_posix_acl(state.idmap,
+							   &state.path,
+							   d_inode(state.path.dentry->d_parent));
 		if (posix_acl_rc)
 			ksmbd_debug(SMB, "inherit posix acl failed : %d\n", posix_acl_rc);
 
-		rc = smb2_create_sd_buffer(work, req, &path);
+		rc = smb2_create_sd_buffer(work, req, &state.path);
 		if (rc && rc != -ENOENT)
 			goto err_out;
 
 		if (rc == -ENOENT) {
 			if (test_share_config_flag(work->tcon->share_conf,
 						   KSMBD_SHARE_FLAG_ACL_XATTR)) {
-				rc = smb_inherit_dacl(conn, &path, sess->user->uid,
+				rc = smb_inherit_dacl(conn, &state.path, sess->user->uid,
 						      sess->user->gid);
 			}
 			if (rc) {
 				if (posix_acl_rc)
-					ksmbd_vfs_set_init_posix_acl(idmap,
-								     &path);
+					ksmbd_vfs_set_init_posix_acl(state.idmap,
+								     &state.path);
 
 				if (test_share_config_flag(work->tcon->share_conf,
 							   KSMBD_SHARE_FLAG_ACL_XATTR)) {
@@ -3801,7 +3792,7 @@ int smb2_open(struct ksmbd_work *work)
 					int pntsd_size;
 					size_t scratch_len;
 
-					ksmbd_acls_fattr(&fattr, idmap, inode);
+					ksmbd_acls_fattr(&fattr, state.idmap, inode);
 					scratch_len = smb_acl_sec_desc_scratch_len(&fattr,
 							NULL, 0,
 							OWNER_SECINFO | GROUP_SECINFO |
@@ -3821,7 +3812,7 @@ int smb2_open(struct ksmbd_work *work)
 						goto err_out;
 					}
 
-					rc = build_sec_desc(idmap,
+					rc = build_sec_desc(state.idmap,
 							    pntsd, NULL, 0,
 							    OWNER_SECINFO |
 							    GROUP_SECINFO |
@@ -3835,8 +3826,8 @@ int smb2_open(struct ksmbd_work *work)
 					}
 
 					rc = ksmbd_vfs_set_sd_xattr(conn,
-								    idmap,
-								    &path,
+								    state.idmap,
+								    &state.path,
 								    pntsd,
 								    pntsd_size,
 								    false);
@@ -3850,63 +3841,63 @@ int smb2_open(struct ksmbd_work *work)
 		rc = 0;
 	}
 
-	if (stream_name) {
-		rc = smb2_set_stream_name_xattr(&path,
-						fp,
-						stream_name,
-						s_type);
+	if (state.stream_name) {
+		rc = smb2_set_stream_name_xattr(&state.path,
+						state.fp,
+						state.stream_name,
+						state.s_type);
 		if (rc)
 			goto err_out;
-		file_info = FILE_CREATED;
+		state.file_info = FILE_CREATED;
 	}
 
-	fp->attrib_only = !(req->DesiredAccess & ~(FILE_READ_ATTRIBUTES_LE |
+	state.fp->attrib_only = !(req->DesiredAccess & ~(FILE_READ_ATTRIBUTES_LE |
 			FILE_WRITE_ATTRIBUTES_LE | FILE_SYNCHRONIZE_LE));
 
-	fp->is_posix_ctxt = posix_ctxt;
+	state.fp->is_posix_ctxt = state.posix_ctxt;
 
 	/* fp should be searchable through ksmbd_inode.m_fp_list
 	 * after daccess, saccess, attrib_only, and stream are
 	 * initialized.
 	 */
-	down_write(&fp->f_ci->m_lock);
-	list_add(&fp->node, &fp->f_ci->m_fp_list);
-	up_write(&fp->f_ci->m_lock);
+	down_write(&state.fp->f_ci->m_lock);
+	list_add(&state.fp->node, &state.fp->f_ci->m_fp_list);
+	up_write(&state.fp->f_ci->m_lock);
 
 	/* Check delete pending among previous fp before oplock break */
-	if (ksmbd_inode_pending_delete(fp)) {
+	if (ksmbd_inode_pending_delete(state.fp)) {
 		rc = -EBUSY;
 		goto err_out;
 	}
 
-	if (!stream_name && daccess & FILE_DELETE_LE &&
-	    ksmbd_has_stream_without_delete_share(fp)) {
+	if (!state.stream_name && state.daccess & FILE_DELETE_LE &&
+	    ksmbd_has_stream_without_delete_share(state.fp)) {
 		rc = -EPERM;
 		goto err_out;
 	}
 
-	if (file_present || created)
-		path_put(&path);
+	if (state.file_present || state.created)
+		path_put(&state.path);
 
-	if (!S_ISDIR(file_inode(filp)->i_mode) && open_flags & O_TRUNC &&
-	    !fp->attrib_only && !stream_name) {
-		smb_break_all_oplock(work, fp);
+	if (!S_ISDIR(file_inode(filp)->i_mode) && state.open_flags & O_TRUNC &&
+	    !state.fp->attrib_only && !state.stream_name) {
+		smb_break_all_oplock(work, state.fp);
 		need_truncate = 1;
 	}
 
-	share_ret = ksmbd_smb_check_shared_mode(fp->filp, fp);
+	share_ret = ksmbd_smb_check_shared_mode(state.fp->filp, state.fp);
 	if (!test_share_config_flag(work->tcon->share_conf, KSMBD_SHARE_FLAG_OPLOCKS) ||
-	    (req_op_level == SMB2_OPLOCK_LEVEL_LEASE &&
+	    (state.req_op_level == SMB2_OPLOCK_LEVEL_LEASE &&
 	     !(conn->vals->req_capabilities & SMB2_GLOBAL_CAP_LEASING))) {
-		if (share_ret < 0 && !S_ISDIR(file_inode(fp->filp)->i_mode)) {
+		if (share_ret < 0 && !S_ISDIR(file_inode(state.fp->filp)->i_mode)) {
 			rc = share_ret;
 			goto err_out1;
 		}
 	} else {
-		if (req_op_level == SMB2_OPLOCK_LEVEL_LEASE && lc) {
+		if (state.req_op_level == SMB2_OPLOCK_LEVEL_LEASE && state.lc) {
 			if (S_ISDIR(file_inode(filp)->i_mode)) {
-				lc->req_state &= ~SMB2_LEASE_WRITE_CACHING_LE;
-				lc->is_dir = true;
+				state.lc->req_state &= ~SMB2_LEASE_WRITE_CACHING_LE;
+				state.lc->is_dir = true;
 			}
 
 			/*
@@ -3914,35 +3905,35 @@ int smb2_open(struct ksmbd_work *work)
 			 * a lease that has same parent key, Send lease break
 			 * notification.
 			 */
-			smb_send_parent_lease_break_noti(fp, lc);
+			smb_send_parent_lease_break_noti(state.fp, state.lc);
 
-			req_op_level = smb2_map_lease_to_oplock(lc->req_state);
+			state.req_op_level = smb2_map_lease_to_oplock(state.lc->req_state);
 			ksmbd_debug(SMB,
 				    "lease req for(%s) req oplock state 0x%x, lease state 0x%x\n",
-				    name, req_op_level, lc->req_state);
-			rc = find_same_lease_key(conn, fp->f_ci, lc);
+				    state.name, state.req_op_level, state.lc->req_state);
+			rc = find_same_lease_key(conn, state.fp->f_ci, state.lc);
 			if (rc)
 				goto err_out1;
-		} else if (open_flags == O_RDONLY &&
-			   (req_op_level == SMB2_OPLOCK_LEVEL_BATCH ||
-			    req_op_level == SMB2_OPLOCK_LEVEL_EXCLUSIVE))
-			req_op_level = SMB2_OPLOCK_LEVEL_II;
+		} else if (state.open_flags == O_RDONLY &&
+			   (state.req_op_level == SMB2_OPLOCK_LEVEL_BATCH ||
+			    state.req_op_level == SMB2_OPLOCK_LEVEL_EXCLUSIVE))
+			state.req_op_level = SMB2_OPLOCK_LEVEL_II;
 
-		rc = smb_grant_oplock(work, req_op_level,
-				      fp->persistent_id, fp,
+		rc = smb_grant_oplock(work, state.req_op_level,
+				      state.fp->persistent_id, state.fp,
 				      le32_to_cpu(req->hdr.Id.SyncId.TreeId),
-				      lc, share_ret);
+				      state.lc, share_ret);
 		if (rc < 0)
 			goto err_out1;
 	}
 
 	if (req->CreateOptions & FILE_DELETE_ON_CLOSE_LE) {
-		smb_break_all_levII_oplock_for_delete(work, fp);
-		ksmbd_fd_set_delete_on_close(fp, file_info);
+		smb_break_all_levII_oplock_for_delete(work, state.fp);
+		ksmbd_fd_set_delete_on_close(state.fp, state.file_info);
 	}
 
 	if (need_truncate) {
-		rc = smb2_create_truncate(&fp->filp->f_path);
+		rc = smb2_create_truncate(&state.fp->filp->f_path);
 		if (rc)
 			goto err_out1;
 	}
@@ -3964,13 +3955,13 @@ int smb2_open(struct ksmbd_work *work)
 				rc = -EINVAL;
 				goto err_out1;
 			}
-			alloc_size = le64_to_cpu(az_req->AllocationSize);
+			state.alloc_size = le64_to_cpu(az_req->AllocationSize);
 			ksmbd_debug(SMB,
 				    "request smb2 create allocate size : %llu\n",
-				    alloc_size);
-			smb_break_all_levII_oplock(work, fp, 1);
-			err = vfs_fallocate(fp->filp, FALLOC_FL_KEEP_SIZE, 0,
-					    alloc_size);
+				    state.alloc_size);
+			smb_break_all_levII_oplock(work, state.fp, 1);
+			err = vfs_fallocate(state.fp->filp, FALLOC_FL_KEEP_SIZE, 0,
+					    state.alloc_size);
 			if (err < 0)
 				ksmbd_debug(SMB,
 					    "vfs_fallocate is failed : %d\n",
@@ -3983,7 +3974,7 @@ int smb2_open(struct ksmbd_work *work)
 			goto err_out1;
 		} else if (context) {
 			ksmbd_debug(SMB, "get query on disk id context\n");
-			query_disk_id = 1;
+			state.query_disk_id = 1;
 		}
 
 		if (conn->is_aapl == false) {
@@ -3996,68 +3987,70 @@ int smb2_open(struct ksmbd_work *work)
 		}
 	}
 
-	rc = ksmbd_vfs_getattr(&path, &stat);
+	rc = ksmbd_vfs_getattr(&state.path, &state.stat);
 	if (rc)
 		goto err_out1;
 
-	if (stat.result_mask & STATX_BTIME)
-		fp->create_time = ksmbd_UnixTimeToNT(stat.btime);
+	if (state.stat.result_mask & STATX_BTIME)
+		state.fp->create_time = ksmbd_UnixTimeToNT(state.stat.btime);
 	else
-		fp->create_time = ksmbd_UnixTimeToNT(stat.ctime);
-	fp->change_time = ksmbd_UnixTimeToNT(stat.ctime);
-	fp->allocation_size = S_ISDIR(stat.mode) ? 0 :
-		(alloc_size ?: stat.blocks << 9);
-	if (req->FileAttributes || fp->f_ci->m_fattr == 0)
-		fp->f_ci->m_fattr =
-			cpu_to_le32(smb2_get_dos_mode(&stat, le32_to_cpu(req->FileAttributes)));
+		state.fp->create_time = ksmbd_UnixTimeToNT(state.stat.ctime);
+	state.fp->change_time = ksmbd_UnixTimeToNT(state.stat.ctime);
+	state.fp->allocation_size = S_ISDIR(state.stat.mode) ? 0 :
+		(state.alloc_size ?: state.stat.blocks << 9);
+	if (req->FileAttributes || state.fp->f_ci->m_fattr == 0)
+		state.fp->f_ci->m_fattr =
+			cpu_to_le32(smb2_get_dos_mode(
+				&state.stat,
+				le32_to_cpu(req->FileAttributes)));
 
-	if (!created)
-		smb2_update_xattrs(tcon, &path, fp);
+	if (!state.created)
+		smb2_update_xattrs(tcon, &state.path, state.fp);
 
-	ksmbd_vfs_update_compressed_fattr(path.dentry, &fp->f_ci->m_fattr);
+	ksmbd_vfs_update_compressed_fattr(state.path.dentry, &state.fp->f_ci->m_fattr);
 
-	if (created)
-		smb2_new_xattrs(tcon, &path, fp);
+	if (state.created)
+		smb2_new_xattrs(tcon, &state.path, state.fp);
 
-	memcpy(fp->client_guid, conn->ClientGUID, SMB2_CLIENT_GUID_SIZE);
+	memcpy(state.fp->client_guid, conn->ClientGUID, SMB2_CLIENT_GUID_SIZE);
 
-	if (dh_info.type == DURABLE_REQ_V2 || dh_info.type == DURABLE_REQ) {
-		if (dh_info.type == DURABLE_REQ_V2 && dh_info.persistent &&
+	if (state.dh_info.type == DURABLE_REQ_V2 || state.dh_info.type == DURABLE_REQ) {
+		if (state.dh_info.type == DURABLE_REQ_V2 && state.dh_info.persistent &&
 		    test_share_config_flag(work->tcon->share_conf,
 					   KSMBD_SHARE_FLAG_CONTINUOUS_AVAILABILITY))
-			fp->is_persistent = true;
+			state.fp->is_persistent = true;
 		else
-			fp->is_durable = true;
+			state.fp->is_durable = true;
 
-		if (dh_info.type == DURABLE_REQ_V2) {
-			memcpy(fp->create_guid, dh_info.CreateGuid,
+		if (state.dh_info.type == DURABLE_REQ_V2) {
+			memcpy(state.fp->create_guid, state.dh_info.CreateGuid,
 					SMB2_CREATE_GUID_SIZE);
-			if (dh_info.app_instance_id)
-				memcpy(fp->app_instance_id,
-				       dh_info.AppInstanceId,
+			if (state.dh_info.app_instance_id)
+				memcpy(state.fp->app_instance_id,
+				       state.dh_info.AppInstanceId,
 				       SMB2_CREATE_GUID_SIZE);
-			if (dh_info.timeout)
-				fp->durable_timeout =
-					min_t(unsigned int, dh_info.timeout,
+			if (state.dh_info.timeout)
+				state.fp->durable_timeout =
+					min_t(unsigned int, state.dh_info.timeout,
 					      DURABLE_HANDLE_MAX_TIMEOUT);
 			else
-				fp->durable_timeout = 60;
+				state.fp->durable_timeout = 60;
 		}
 	}
 
 reconnected_fp:
 	rsp->StructureSize = cpu_to_le16(89);
-	opinfo = opinfo_get(fp);
+	opinfo = opinfo_get(state.fp);
 	rsp->OplockLevel = opinfo != NULL ? opinfo->level : 0;
 	rsp->Flags = 0;
-	rsp->CreateAction = cpu_to_le32(file_info);
-	rsp->CreationTime = cpu_to_le64(fp->create_time);
-	time = ksmbd_UnixTimeToNT(stat.atime);
+	rsp->CreateAction = cpu_to_le32(state.file_info);
+	rsp->CreationTime = cpu_to_le64(state.fp->create_time);
+	time = ksmbd_UnixTimeToNT(state.stat.atime);
 	rsp->LastAccessTime = cpu_to_le64(time);
-	time = ksmbd_UnixTimeToNT(stat.mtime);
-	fp->open_mtime = time;
+	time = ksmbd_UnixTimeToNT(state.stat.mtime);
+	state.fp->open_mtime = time;
 	rsp->LastWriteTime = cpu_to_le64(time);
-	rsp->ChangeTime = cpu_to_le64(fp->change_time);
+	rsp->ChangeTime = cpu_to_le64(state.fp->change_time);
 	/*
 	 * The cached allocation size hides filesystem rounding for the
 	 * requested allocation, but it can go stale when the file grows past
@@ -4068,27 +4061,27 @@ reconnected_fp:
 	 * using the raw on-disk block count, which can include filesystem
 	 * preallocation and metadata rounding.
 	 */
-	if (!S_ISDIR(stat.mode) && stat.size > fp->allocation_size)
-		fp->allocation_size = round_up(stat.size, stat.blksize);
-	rsp->AllocationSize = cpu_to_le64(fp->allocation_size);
-	rsp->EndofFile = S_ISDIR(stat.mode) ? 0 : cpu_to_le64(stat.size);
-	rsp->FileAttributes = fp->f_ci->m_fattr;
+	if (!S_ISDIR(state.stat.mode) && state.stat.size > state.fp->allocation_size)
+		state.fp->allocation_size = round_up(state.stat.size, state.stat.blksize);
+	rsp->AllocationSize = cpu_to_le64(state.fp->allocation_size);
+	rsp->EndofFile = S_ISDIR(state.stat.mode) ? 0 : cpu_to_le64(state.stat.size);
+	rsp->FileAttributes = state.fp->f_ci->m_fattr;
 
 	rsp->Reserved2 = 0;
 
-	rsp->PersistentFileId = fp->persistent_id;
-	rsp->VolatileFileId = fp->volatile_id;
+	rsp->PersistentFileId = state.fp->persistent_id;
+	rsp->VolatileFileId = state.fp->volatile_id;
 
 	rsp->CreateContextsOffset = 0;
 	rsp->CreateContextsLength = 0;
-	iov_len = offsetof(struct smb2_create_rsp, Buffer);
+	state.iov_len = offsetof(struct smb2_create_rsp, Buffer);
 
 	/* If lease is request send lease context response */
 	if (opinfo && opinfo->is_lease) {
 		struct create_context *lease_ccontext;
 
 		ksmbd_debug(SMB, "lease granted on(%s) lease state 0x%x\n",
-			    name, opinfo->o_lease->state);
+			    state.name, opinfo->o_lease->state);
 		rsp->OplockLevel = SMB2_OPLOCK_LEVEL_LEASE;
 
 		lease_ccontext = (struct create_context *)rsp->Buffer;
@@ -4096,35 +4089,35 @@ reconnected_fp:
 		create_lease_buf(rsp->Buffer, opinfo->o_lease);
 		le32_add_cpu(&rsp->CreateContextsLength,
 			     conn->vals->create_lease_size);
-		iov_len += conn->vals->create_lease_size;
+		state.iov_len += conn->vals->create_lease_size;
 		next_ptr = &lease_ccontext->Next;
 		next_off = conn->vals->create_lease_size;
 	}
 	opinfo_put(opinfo);
 
-	if (maximal_access_ctxt) {
+	if (state.maximal_access_ctxt) {
 		struct create_context *mxac_ccontext;
 
-		if (maximal_access == 0)
-			ksmbd_vfs_query_maximal_access(idmap,
-						       path.dentry,
-						       &maximal_access);
+		if (state.maximal_access == 0)
+			ksmbd_vfs_query_maximal_access(state.idmap,
+						       state.path.dentry,
+						       &state.maximal_access);
 		mxac_ccontext = (struct create_context *)(rsp->Buffer +
 				le32_to_cpu(rsp->CreateContextsLength));
 		contxt_cnt++;
 		create_mxac_rsp_buf(rsp->Buffer +
 				le32_to_cpu(rsp->CreateContextsLength),
-				le32_to_cpu(maximal_access));
+				le32_to_cpu(state.maximal_access));
 		le32_add_cpu(&rsp->CreateContextsLength,
 			     conn->vals->create_mxac_size);
-		iov_len += conn->vals->create_mxac_size;
+		state.iov_len += conn->vals->create_mxac_size;
 		if (next_ptr)
 			*next_ptr = cpu_to_le32(next_off);
 		next_ptr = &mxac_ccontext->Next;
 		next_off = conn->vals->create_mxac_size;
 	}
 
-	if (query_disk_id) {
+	if (state.query_disk_id) {
 		struct create_context *disk_id_ccontext;
 
 		disk_id_ccontext = (struct create_context *)(rsp->Buffer +
@@ -4132,35 +4125,35 @@ reconnected_fp:
 		contxt_cnt++;
 		create_disk_id_rsp_buf(rsp->Buffer +
 				le32_to_cpu(rsp->CreateContextsLength),
-				stat.ino, tcon->id);
+				state.stat.ino, tcon->id);
 		le32_add_cpu(&rsp->CreateContextsLength,
 			     conn->vals->create_disk_id_size);
-		iov_len += conn->vals->create_disk_id_size;
+		state.iov_len += conn->vals->create_disk_id_size;
 		if (next_ptr)
 			*next_ptr = cpu_to_le32(next_off);
 		next_ptr = &disk_id_ccontext->Next;
 		next_off = conn->vals->create_disk_id_size;
 	}
 
-	if (dh_info.type == DURABLE_REQ || dh_info.type == DURABLE_REQ_V2) {
+	if (state.dh_info.type == DURABLE_REQ || state.dh_info.type == DURABLE_REQ_V2) {
 		struct create_context *durable_ccontext;
 
 		durable_ccontext = (struct create_context *)(rsp->Buffer +
 				le32_to_cpu(rsp->CreateContextsLength));
 		contxt_cnt++;
-		if (dh_info.type == DURABLE_REQ) {
+		if (state.dh_info.type == DURABLE_REQ) {
 			create_durable_rsp_buf(rsp->Buffer +
 					le32_to_cpu(rsp->CreateContextsLength));
 			le32_add_cpu(&rsp->CreateContextsLength,
 					conn->vals->create_durable_size);
-			iov_len += conn->vals->create_durable_size;
+			state.iov_len += conn->vals->create_durable_size;
 		} else {
 			create_durable_v2_rsp_buf(rsp->Buffer +
 					le32_to_cpu(rsp->CreateContextsLength),
-					fp);
+					state.fp);
 			le32_add_cpu(&rsp->CreateContextsLength,
 					conn->vals->create_durable_v2_size);
-			iov_len += conn->vals->create_durable_v2_size;
+			state.iov_len += conn->vals->create_durable_v2_size;
 		}
 
 		if (next_ptr)
@@ -4169,14 +4162,14 @@ reconnected_fp:
 		next_off = conn->vals->create_durable_size;
 	}
 
-	if (posix_ctxt) {
+	if (state.posix_ctxt) {
 		contxt_cnt++;
 		create_posix_rsp_buf(rsp->Buffer +
 				le32_to_cpu(rsp->CreateContextsLength),
-				fp);
+				state.fp);
 		le32_add_cpu(&rsp->CreateContextsLength,
 			     conn->vals->create_posix_size);
-		iov_len += conn->vals->create_posix_size;
+		state.iov_len += conn->vals->create_posix_size;
 		if (next_ptr)
 			*next_ptr = cpu_to_le32(next_off);
 	}
@@ -4187,18 +4180,18 @@ reconnected_fp:
 	}
 
 err_out:
-	if (rc && (file_present || created))
-		path_put(&path);
+	if (rc && (state.file_present || state.created))
+		path_put(&state.path);
 
 err_out1:
 	ksmbd_revert_fsids(work);
 
 err_out2:
 	if (!rc) {
-		rc = ksmbd_update_fstate(&work->sess->file_table, fp,
+		rc = ksmbd_update_fstate(&work->sess->file_table, state.fp,
 					 FP_INITED);
 		if (!rc)
-			rc = ksmbd_iov_pin_rsp(work, (void *)rsp, iov_len);
+			rc = ksmbd_iov_pin_rsp(work, (void *)rsp, state.iov_len);
 	}
 	if (rc) {
 		if (rc == -EINVAL)
@@ -4226,13 +4219,13 @@ err_out2:
 		if (!rsp->hdr.Status)
 			rsp->hdr.Status = STATUS_UNEXPECTED_IO_ERROR;
 
-		if (fp)
-			ksmbd_fd_put(work, fp);
+		if (state.fp)
+			ksmbd_fd_put(work, state.fp);
 		smb2_set_err_rsp(work);
 		ksmbd_debug(SMB, "Error response: %x\n", rsp->hdr.Status);
 	}
 
-	if (dh_info.reconnected) {
+	if (state.dh_info.reconnected) {
 		/*
 		 * If reconnect succeeded, fp was republished in the
 		 * session file table.  On a later error, ksmbd_fd_put()
@@ -4240,14 +4233,14 @@ err_out2:
 		 * lookup reference through the same session-aware path so
 		 * final close removes the volatile id before freeing fp.
 		 */
-		if (rc && fp == dh_info.fp)
-			ksmbd_fd_put(work, dh_info.fp);
+		if (rc && state.fp == state.dh_info.fp)
+			ksmbd_fd_put(work, state.dh_info.fp);
 		else
-			ksmbd_put_durable_fd(dh_info.fp);
+			ksmbd_put_durable_fd(state.dh_info.fp);
 	}
 
-	kfree(name);
-	kfree(lc);
+	kfree(state.name);
+	kfree(state.lc);
 
 	return rc;
 }
